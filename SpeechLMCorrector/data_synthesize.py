@@ -2,7 +2,7 @@
 
 Pipeline
 --------
-1. Collect .wav files from a training folder (or re-use paths from a previous run).
+1. Collect .wav files from a training folder.
 2. Run batch streaming inference (no error corrector) to produce per-file beam histories.
 3. Align each beam candidate against the ground-truth reference and emit
    (previous_transcript, k_best_candidates, continuation_transcript) triples
@@ -233,14 +233,11 @@ def _append_samples(samples: list[dict[str, Any]], output_path: str) -> None:
             f.write(json.dumps(sample, ensure_ascii=False) + "\n")
 
 
-def load_existing_samples(
-    jsonl_path: str,
-) -> tuple[list[str], dict[tuple[str, float], str]]:
-    """Load (audio_paths, label_map) from an existing output .jsonl file."""
+def load_existing_audio_paths(jsonl_path: str) -> list[str]:
+    """Return audio paths already present in an existing output .jsonl file."""
     audio_paths: set[str] = set()
-    label_map: dict[tuple[str, float], str] = {}
     if not os.path.exists(jsonl_path):
-        return [], label_map
+        return []
     with open(jsonl_path, encoding="utf-8") as f:
         for line in f:
             try:
@@ -248,8 +245,7 @@ def load_existing_samples(
             except json.JSONDecodeError:
                 continue
             audio_paths.add(s["audio_path"])
-            label_map[(s["audio_path"], s["timestamp"])] = s["continuation_transcript"]
-    return list(audio_paths), label_map
+    return list(audio_paths)
 
 
 def collect_audio_paths(folder: str) -> list[str]:
@@ -301,12 +297,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-files", type=int, default=10000,
                    help="Randomly sample at most this many files (0 = no limit)")
     p.add_argument("--seed", type=int, default=21)
-    p.add_argument("--reuse-existing", action="store_true",
-                   help=(
-                       "Re-run inference on audio paths already present in --output-file "
-                       "rather than scanning --audio-dir. Useful to refresh labels with a "
-                       "new reference file."
-                   ))
     p.add_argument("--keep-batch-output", action="store_true",
                    help="Keep the temporary batch output directory after synthesis")
     return p
@@ -321,23 +311,17 @@ def main() -> None:
     output_path = os.path.join(args.output_dir, args.output_file)
     failed_log = os.path.join(args.output_dir, "failed_audio.txt")
 
-    existing_paths, label_map = load_existing_samples(output_path)
-    print(f"Existing output: {len(existing_paths)} audio paths, {len(label_map)} labels ({output_path})")
+    existing_paths = load_existing_audio_paths(output_path)
+    print(f"Existing output: {len(existing_paths)} audio paths ({output_path})")
 
-    if args.reuse_existing:
-        done_basenames = {os.path.basename(p) for p in existing_paths}
-        audio_paths = [p for p in existing_paths if os.path.basename(p) not in done_basenames]
-        print(f"Re-processing {len(audio_paths)} files not yet in output")
-    else:
-        all_audio = collect_audio_paths(args.audio_dir)
-        print(f"Found {len(all_audio)} audio files in {args.audio_dir}")
-        done_basenames = {os.path.basename(p) for p in existing_paths}
-        audio_paths = [ap for ap in all_audio if os.path.basename(ap) not in done_basenames]
-        print(f"After filtering already-processed: {len(audio_paths)} files to process")
-        if args.max_files and len(audio_paths) > args.max_files:
-            audio_paths = random.sample(audio_paths, args.max_files)
-            print(f"Sampled {len(audio_paths)} files (--max-files {args.max_files})")
-        label_map = {}
+    all_audio = collect_audio_paths(args.audio_dir)
+    print(f"Found {len(all_audio)} audio files in {args.audio_dir}")
+    done_basenames = {os.path.basename(p) for p in existing_paths}
+    audio_paths = [ap for ap in all_audio if os.path.basename(ap) not in done_basenames]
+    print(f"After filtering already-processed: {len(audio_paths)} files to process")
+    if args.max_files and len(audio_paths) > args.max_files:
+        audio_paths = random.sample(audio_paths, args.max_files)
+        print(f"Sampled {len(audio_paths)} files (--max-files {args.max_files})")
 
     if not audio_paths:
         print("No new audio files to process. Exiting.")
@@ -380,13 +364,6 @@ def main() -> None:
                 num_candidates=args.num_candidates,
                 chunk_size=args.chunk_size,
             )
-
-            if args.reuse_existing and label_map:
-                for s in samples:
-                    saved = label_map.get((real_path, s["timestamp"]))
-                    if saved:
-                        s["continuation_transcript"] = saved
-                samples = [s for s in samples if s["continuation_transcript"]]
 
             _append_samples(samples, output_path)
             total += len(samples)
