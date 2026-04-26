@@ -1,0 +1,11 @@
+{
+  "file": "13202e1ede2b4ad497a35b714916fd64.wav",
+  "reference": "对不对？",
+  "generated": "知道",
+  "cer": 1.0,
+  "mer": 1.0,
+  "ref_length": 4,
+  "gen_length": 2,
+  "first_token_latency_ms": 186.06829643249512,
+  "last_token_latency_ms": 186.1569881439209
+}

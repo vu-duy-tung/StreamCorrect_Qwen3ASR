@@ -1,0 +1,20 @@
+{
+  "audio_path": "/data/mino/StreamCorrect/qwen3-asr-ft-dataset/m0_waihu_20250731/wav/test/13202e1ede2b4ad497a35b714916fd64.wav",
+  "duration": 0.94,
+  "final_text": "知道",
+  "first_token_latency_ms": 186.06829643249512,
+  "last_token_latency_ms": 186.1569881439209,
+  "history": [
+    {
+      "end_time": 0.38,
+      "previous_transcript": "",
+      "topk": [
+        "知道",
+        "不知道",
+        "知道吗",
+        "知道"
+      ],
+      "source": "finish"
+    }
+  ]
+}

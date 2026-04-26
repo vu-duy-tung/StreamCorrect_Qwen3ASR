@@ -1,0 +1,12 @@
+{
+  "audio_file": "/data/mino/StreamCorrect/qwen3-asr-ft-dataset/m0_waihu_20250731/wav/test/13202e1ede2b4ad497a35b714916fd64.wav",
+  "duration": 0.94,
+  "segments": [
+    {
+      "emission_time": 0.94,
+      "start": 0.38,
+      "end": 0.38,
+      "text": "知道"
+    }
+  ]
+}
