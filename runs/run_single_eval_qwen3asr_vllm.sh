@@ -34,7 +34,8 @@ echo "GPU:            $GPU"
 echo "Error corrector:${ERROR_CORRECTOR_CKPT:- (disabled)}"
 echo ""
 
-CMD="$PYTHON ../qwen3asr_streaming_vllm_beam_async.py \"$AUDIO_PATH\" \
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CMD="$PYTHON $REPO_ROOT/qwen3asr_streaming_vllm_beam_async.py \"$AUDIO_PATH\" \
     --model \"$MODEL\" \
     --language $LANGUAGE \
     --chunk-size $CHUNK_SIZE \
