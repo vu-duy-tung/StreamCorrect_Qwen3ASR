@@ -36,6 +36,7 @@ def run_batch_inference(
     num_candidates: int,
     gpus: str,
     num_workers: int,
+    initial_buffer: float,
 ) -> None:
     """Run batch streaming inference, writing per-file beam histories to batch_output_dir.
 
@@ -68,6 +69,7 @@ def run_batch_inference(
         "GPUS": gpus,
         "USE_ERROR_CORRECTOR": "false",
         "HF_HUB_OFFLINE": "1",
+        "INITIAL_BUFFER": str(initial_buffer),
     }
     print(f"  AUDIO_DIR:   {link_dir}")
     print(f"  OUTPUT_DIR:  {batch_output_dir}")
@@ -171,13 +173,18 @@ def synthesize_samples(
     beam_history: list[dict[str, Any]],
     num_candidates: int,
     chunk_size: int,
+    initial_buffer: float,
 ) -> list[dict[str, Any]]:
     """Convert one file's beam history into error-correction training samples.
 
     For each history entry:
       1. Normalize prev and top-k candidates.
-      2. Align norm_prev against norm_ref to find where the previous transcript ends.
-      3. Slice norm_ref[end:end+pred_len] as the ground-truth continuation.
+      2. Compute chunk duration (end_time of current entry minus end_time of previous).
+         For the first entry the duration equals end_time directly.
+      3a. Short chunk (duration < initial_buffer for first entry, < chunk_size_s for
+          later entries): audio has run out after this chunk, so use norm_ref[end_pos:]
+          as the continuation (everything from the alignment point to the end).
+      3b. Normal chunk: align norm_prev against norm_ref, slice pred_len chars.
     """
     if not ref:
         return []
@@ -185,8 +192,9 @@ def synthesize_samples(
     if not norm_ref:
         return []
 
+    chunk_size_s = chunk_size / 1000.0
     samples: list[dict[str, Any]] = []
-    for entry in beam_history:
+    for i, entry in enumerate(beam_history):
         norm_prev = _normalize_text(entry.get("previous_transcript") or "")
         norm_topk = [
             _normalize_text(t)
@@ -197,17 +205,25 @@ def synthesize_samples(
         if not norm_topk:
             continue
 
-        pred_len = len(norm_topk[0]) - len(norm_prev)
-        if pred_len <= 0:
-            continue
+        end_time = float(entry.get("end_time", 0.0))
+        prev_end_time = float(beam_history[i - 1].get("end_time", 0.0)) if i > 0 else 0.0
+        chunk_duration = end_time - prev_end_time
+        threshold = initial_buffer if i == 0 else chunk_size_s
+        is_short_chunk = chunk_duration < threshold
 
         end_pos = _align_prev_end(norm_prev, norm_ref)
         if end_pos >= len(norm_ref):
             continue
 
-        continuation = norm_ref[end_pos : end_pos + pred_len]
-        if not continuation:
-            continue
+        if is_short_chunk:
+            continuation = norm_ref[end_pos:]
+        else:
+            pred_len = len(norm_topk[0]) - len(norm_prev)
+            if pred_len <= 0:
+                continue
+            continuation = norm_ref[end_pos : end_pos + pred_len]
+            if not continuation:
+                continue
 
         samples.append({
             "k_best_candidates": norm_topk,
@@ -296,6 +312,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Beam width / number of top-k candidates to store")
     p.add_argument("--max-files", type=int, default=10000,
                    help="Randomly sample at most this many files (0 = no limit)")
+    p.add_argument("--initial-buffer", type=float, default=1.0,
+                   help="Initial audio buffer size in seconds before first inference")
     p.add_argument("--seed", type=int, default=21)
     p.add_argument("--keep-batch-output", action="store_true",
                    help="Keep the temporary batch output directory after synthesis")
@@ -342,6 +360,7 @@ def main() -> None:
         num_candidates=args.num_candidates,
         gpus=args.gpus,
         num_workers=num_workers,
+        initial_buffer=args.initial_buffer,
     )
 
     print("\nSynthesizing training samples from beam histories ...")
@@ -363,6 +382,7 @@ def main() -> None:
                 beam_history=history,
                 num_candidates=args.num_candidates,
                 chunk_size=args.chunk_size,
+                initial_buffer=args.initial_buffer,
             )
 
             _append_samples(samples, output_path)
