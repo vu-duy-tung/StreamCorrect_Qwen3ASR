@@ -36,33 +36,21 @@ LANG_CODE_TO_NAME = {
 
 
 # ---------------------------------------------------------------------------
-# Text normalization -- matches the canonical form used in
-# data_synthesize_qwen3asr.py so that inference-time prompts align with
-# the training data format.
+# Minimal ASR-artifact stripper — removes model special tokens and the Unicode
+# replacement character (U+FFFD) that can appear when tokenization fails.
+# No whitespace removal, no punctuation stripping, no case folding.
 # ---------------------------------------------------------------------------
 
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
 
 
 def _normalize_text(s):
-    """Canonical form: strip ASR specials, U+FFFD, whitespace, punctuation;
-    NFKC fold; lowercase ASCII."""
+    """Strip ASR special tokens and U+FFFD only; leave all other content intact."""
     if not s:
         return ""
     s = _SPECIAL_TOKEN_RE.sub("", s)
     s = s.replace("\ufffd", "")
-    s = unicodedata.normalize("NFKC", s)
-    out = []
-    for ch in s:
-        if ch.isspace():
-            continue
-        cat = unicodedata.category(ch)
-        if cat.startswith("P"):
-            continue
-        if ch.isascii() and ch.isalpha():
-            ch = ch.lower()
-        out.append(ch)
-    return "".join(out)
+    return s
 
 
 def qwen3asr_args(parser):
@@ -98,6 +86,7 @@ def qwen3asr_args(parser):
         '--error-corrector-type', type=str, choices=['speechlm', 'lm'], default='speechlm',
         help='Corrector type: "speechlm" (audio+text, default) or "lm" (text-only).',
     )
+
 
 
 def qwen3_asr_factory(args):
@@ -185,8 +174,6 @@ class Qwen3ASRBackendASR(ASRBase):
         try:
             candidates, best_raw, beam_prefix = self._beam_search(state['audio_accum'], state, self.beams)
             if candidates and len(candidates) > 0:
-                # Store normalized form so prefix construction on the next
-                # chunk sees the same canonical format as training data.
                 state['_raw_decoded'] = _normalize_text(best_raw)
                 state['chunk_id'] += 1
         except Exception as e:
@@ -198,7 +185,7 @@ class Qwen3ASRBackendASR(ASRBase):
             )
             text = results[0].text.strip()
             candidates = [_normalize_text(text)]
-            state['_raw_decoded'] = _normalize_text(text)
+            state['_raw_decoded'] = text
             state['chunk_id'] += 1
 
         return candidates, state, beam_prefix
@@ -245,12 +232,10 @@ class Qwen3ASRBackendASR(ASRBase):
         else:
             BLOCK_SIZE = int(block_arg)
 
-        # Normalize the raw decoded text so the prefix matches training format
-        # (no punctuation, whitespace, or special tokens).
-        norm_raw_decoded = _normalize_text(state['_raw_decoded'])
+        raw_decoded = _normalize_text(state['_raw_decoded'])
         prefix = ""
         if state['chunk_id'] >= state['unfixed_chunk_num']:
-            cur_ids = tokenizer.encode(norm_raw_decoded, add_special_tokens=False)
+            cur_ids = tokenizer.encode(raw_decoded, add_special_tokens=False)
             k = int(state['unfixed_token_num'])
             while True:
                 end_idx = max(0, len(cur_ids) - k)
@@ -413,16 +398,11 @@ class Qwen3ASRBackendASR(ASRBase):
             _, text = parse_asr_output(raw_complete, user_language=self.force_language)
             candidates.append(text.strip())
 
-        # Normalize candidates so downstream (delta extraction, beam history,
-        # error corrector) all see canonical form matching training data.
-        norm_candidates = [_normalize_text(c) for c in candidates]
-        norm_best_raw = _normalize_text(best_raw_decoded)
-
-        logger.info(f'[Qwen3-ASR vLLM block-beam] {len(norm_candidates)} candidates (block_size={BLOCK_SIZE}):')
-        for i, cc in enumerate(norm_candidates):
+        logger.info(f'[Qwen3-ASR vLLM block-beam] {len(candidates)} candidates (block_size={BLOCK_SIZE}):')
+        for i, cc in enumerate(candidates):
             logger.info(f'  [{i}] {cc}')
 
-        return norm_candidates, norm_best_raw, _normalize_text(prefix)
+        return candidates, best_raw_decoded, prefix
 
     def warmup(self, audio, init_prompt=''):
         logger.info('Warming up Qwen3-ASR...')
@@ -542,7 +522,7 @@ class Qwen3ASROnline(OnlineProcessorInterface):
                     corrector_type=corrector_type,
                 )
                 if corrected_suffix is not None:
-                    corrected_top1 = beam_prefix + _normalize_text(corrected_suffix)
+                    corrected_top1 = beam_prefix + corrected_suffix
 
             self._beam_history.append({
                 'end_time': float(self.end),
@@ -550,10 +530,7 @@ class Qwen3ASROnline(OnlineProcessorInterface):
                 'topk': list(candidates),
                 'source': 'process_iter',
             })
-            # Update per-segment top-1 memory for the NEXT chunk.
-            # Use the corrected top-1 so subsequent chunks build on the
-            # corrected transcript rather than the raw ASR output.
-            self._last_top1_in_segment = _normalize_text(corrected_top1) if corrected_top1 else self._last_top1_in_segment
+            self._last_top1_in_segment = corrected_top1 if corrected_top1 else self._last_top1_in_segment
 
         self.frame_delay = True
         return {'first_token_latency': self.first_token_latency}
@@ -593,9 +570,7 @@ class Qwen3ASROnline(OnlineProcessorInterface):
 
         all_audio_arr = np.concatenate(self.all_audio, axis=0) if self.all_audio else np.zeros((0,))
 
-        # committed_text is always in normalized form; candidates are already
-        # normalized by _beam_search.
-        norm_committed = _normalize_text(self.committed_text)
+        norm_committed = self.committed_text
 
         full_text = ''
         if candidates and not all(c.strip() == '' for c in candidates):
@@ -611,17 +586,14 @@ class Qwen3ASROnline(OnlineProcessorInterface):
                     corrector_type=corrector_type,
                 )
                 if corrected_suffix is not None:
-                    full_text = beam_prefix + _normalize_text(corrected_suffix)
+                    full_text = beam_prefix + corrected_suffix
                 else:
                     full_text = top1_text
             else:
                 full_text = top1_text
 
-        # Update _last_top1_in_segment to reflect the corrected full_text
-        # (not the raw candidate), so the beam_history and subsequent
-        # processing see the corrected version.
         if full_text:
-            self._last_top1_in_segment = _normalize_text(full_text)
+            self._last_top1_in_segment = full_text
 
         delta = full_text[len(norm_committed):] if full_text.startswith(norm_committed) else ''
         if not delta and full_text and not full_text.startswith(norm_committed):
@@ -665,9 +637,20 @@ class Qwen3ASROnline(OnlineProcessorInterface):
 # Error corrector
 # ---------------------------------------------------------------------------
 
+def _token_confidence(gen_out, new_token_ids):
+    """Mean log-prob of generated tokens (requires return_dict_in_generate=True)."""
+    if not hasattr(gen_out, 'scores') or not gen_out.scores:
+        return float('-inf')
+    log_probs = []
+    for score, tid in zip(gen_out.scores, new_token_ids):
+        log_probs.append(torch.log_softmax(score[0], dim=-1)[tid].item())
+    return sum(log_probs) / len(log_probs) if log_probs else float('-inf')
+
+
 def _run_error_corrector(
     audio_np, candidates, previous_text,
     corrector_model, corrector_processor, corrector_type,
+    return_confidence=False,
 ):
     """Run the SpeechLM or LM error corrector on top-k beam search candidates."""
     prev_display = previous_text
@@ -681,7 +664,7 @@ def _run_error_corrector(
         if text.strip():
             cleaned.append(text)
     if not cleaned:
-        return None
+        return (None, None) if return_confidence else None
 
     # ---- LM (text-only) corrector ----
     if corrector_type == 'lm':
@@ -698,21 +681,26 @@ def _run_error_corrector(
         model_device = next(corrector_model.parameters()).device
         inputs = {k: v.to(model_device) for k, v in inputs.items()}
         with torch.no_grad():
-            gen = corrector_model.generate(
+            gen_out = corrector_model.generate(
                 **inputs, max_new_tokens=8, do_sample=False,
+                output_scores=return_confidence,
+                return_dict_in_generate=return_confidence,
                 pad_token_id=corrector_processor.pad_token_id,
                 eos_token_id=corrector_processor.eos_token_id,
             )
+        gen = gen_out.sequences if return_confidence else gen_out
+        input_length = inputs['input_ids'].shape[1]
         response = corrector_processor.decode(
-            gen[0, inputs['input_ids'].shape[1]:], skip_special_tokens=True,
+            gen[0, input_length:], skip_special_tokens=True,
         ).strip()
+        confidence = _token_confidence(gen_out, gen[0, input_length:]) if return_confidence else None
 
         print('============ LM CORRECTOR =============')
         print(f'Previous: {prev_display}')
         print(f'Candidates: {cleaned}')
         print(f'Corrected suffix: {response}')
         print('=======================================')
-        return response
+        return (response, confidence) if return_confidence else response
 
     # ---- SpeechLM corrector (audio + text) ----
     from SpeechLMCorrector.training_qwen2audio import format_instruction_for_correction
@@ -759,24 +747,31 @@ def _run_error_corrector(
               for k, v in inputs.items()}
 
     with torch.no_grad():
-        gen = corrector_model.generate(
+        gen_out = corrector_model.generate(
             **inputs, max_new_tokens=8, do_sample=False,
+            output_scores=return_confidence,
+            return_dict_in_generate=return_confidence,
             pad_token_id=corrector_processor.tokenizer.pad_token_id,
             eos_token_id=corrector_processor.tokenizer.eos_token_id,
         )
+    gen = gen_out.sequences if return_confidence else gen_out
 
     input_length = inputs['input_ids'].shape[1]
     new_tokens = gen[:, input_length:]
     response = corrector_processor.tokenizer.decode(
         new_tokens[0], skip_special_tokens=True,
     ).strip()
+    confidence = _token_confidence(gen_out, gen[0, input_length:]) if return_confidence else None
 
     print('======== SPEECHLM CORRECTOR ============')
     print(f'Previous: {prev_display}')
     print(f'Candidates: {cleaned}')
     print(f'Corrected suffix: {response}')
     print('========================================')
-    return response
+    return (response, confidence) if return_confidence else response
+
+
+
 
 
 if __name__ == '__main__':

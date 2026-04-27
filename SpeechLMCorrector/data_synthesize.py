@@ -122,24 +122,12 @@ _SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
 
 
 def _normalize_text(s: str) -> str:
-    """Canonical form used for both alignment and training labels.
-
-    Steps: strip ASR special tokens → drop U+FFFD → NFKC → drop whitespace
-    and Unicode punctuation → lowercase ASCII letters.
-    """
+    """Strip ASR special tokens and U+FFFD only; leave all other content intact."""
     if not s:
         return ""
     s = _SPECIAL_TOKEN_RE.sub("", s)
     s = s.replace("\ufffd", "")
-    s = unicodedata.normalize("NFKC", s)
-    out: list[str] = []
-    for ch in s:
-        if ch.isspace() or unicodedata.category(ch).startswith("P"):
-            continue
-        out.append(ch.lower() if ch.isascii() and ch.isalpha() else ch)
-    return "".join(out)
-
-
+    return s
 def _align_prev_end(norm_prev: str, norm_ref: str) -> int:
     """Return j* in [0, len(norm_ref)] that minimises edit_dist(norm_prev, norm_ref[:j*]).
 

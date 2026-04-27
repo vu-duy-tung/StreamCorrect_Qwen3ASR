@@ -144,18 +144,8 @@ def _normalize_for_mer(text: str, language: str) -> Tuple[str, Optional[str]]:
     if not normalized:
         return '', None
 
-    normalization_language = _resolve_normalization_language(language, normalized)
-
-    if normalization_language:
-        normalized = normalize_utterances(normalized, language=normalization_language)
-    else:
-        normalized = normalized.lower()
-
-    normalized = replace_punctuation_with_space(normalized)
-
-    # Collapse repeated whitespace and trim
-    normalized = re.sub(r'\s+', ' ', normalized).strip()
-    return normalized, normalization_language
+    # No normalization: return text as-is.
+    return normalized, None
 
 
 def mixed_tokenize(text: str, language: str) -> List[str]:
@@ -204,31 +194,7 @@ def calculate_cer(reference: str, hypothesis: str, language: str) -> float:
     ref = reference.strip()
     hyp = hypothesis.strip()
 
-    normalization_language = _resolve_normalization_language(language, ref + hyp)
-
-    if normalization_language:
-        ref = normalize_utterances(ref, language=normalization_language)
-        hyp = normalize_utterances(hyp, language=normalization_language)
-
-        # Remove punctuation for Cantonese/Yue
-        ref = ref.translate(str.maketrans('', '', string.punctuation))
-        hyp = hyp.translate(str.maketrans('', '', string.punctuation))
-        ref = remove_punctuation_unicode(ref)
-        hyp = remove_punctuation_unicode(hyp)
-
-        # Remove spaces strictly between two consecutive Mandarin/Yue characters
-        cjk_pattern = r'([\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF])\s+(?=[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF])'
-        ref = re.sub(cjk_pattern, r'\1', ref)
-        hyp = re.sub(cjk_pattern, r'\1', hyp)
-    else:
-        # For other languages, just lower case and strip
-        ref = ref.lower()
-        hyp = hyp.lower()
-        ref = ref.translate(str.maketrans('', '', string.punctuation))
-        hyp = hyp.translate(str.maketrans('', '', string.punctuation))
-
-    print("Ref:", ref)
-    print("Hyp:", hyp)
+    # No normalization: compare raw stripped text.
     return cer(ref, hyp)
 
 def calculate_mer(reference: str, hypothesis: str, language: str, char_weight: float = 0.5) -> float:
@@ -367,20 +333,8 @@ def evaluate_transcriptions(references, generated, language):
             cer_score = calculate_cer(ref_text, gen_text, language)
             mer_score = calculate_mer(ref_text, gen_text, language)
 
-            # Normalize displayed text with the same pipeline used for CER so
-            # per_file_results reflects what the metric actually measures.
-            norm_lang = _resolve_normalization_language(language, ref_text + gen_text)
-            if norm_lang:
-                ref_display = normalize_utterances(ref_text, language=norm_lang)
-                gen_display = normalize_utterances(gen_text, language=norm_lang)
-                ref_display = remove_punctuation_unicode(ref_display.translate(str.maketrans('', '', string.punctuation)))
-                gen_display = remove_punctuation_unicode(gen_display.translate(str.maketrans('', '', string.punctuation)))
-                _cjk_sp = r'([㐀-䶿一-鿿豈-﫿])\s+(?=[㐀-䶿一-鿿豈-﫿])'
-                ref_display = re.sub(_cjk_sp, r'\1', ref_display)
-                gen_display = re.sub(_cjk_sp, r'\1', gen_display)
-            else:
-                ref_display = ref_text.lower().translate(str.maketrans('', '', string.punctuation))
-                gen_display = gen_text.lower().translate(str.maketrans('', '', string.punctuation))
+            ref_display = ref_text.strip()
+            gen_display = gen_text.strip()
 
             results.append({
                 'file': filename,
