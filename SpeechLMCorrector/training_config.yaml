@@ -125,8 +125,6 @@ train_data_paths:
     weight: 3  # ~16k samples × 2 — upweighted to balance with larger KeSpeech/AISHELL sets
   - path: "../SpeechLMCorrector/data/synthesized_data_v3/waihu_qwen3asr_train_1s_chunk_size_dedup.jsonl"
     weight: 3
-  - path: "../SpeechLMCorrector/data/synthesized_data_v3/waihu_qwen3asr_test_dedup.jsonl"
-    weight: 1
   - path: "../SpeechLMCorrector/data/synthesized_data_v3/kespeech_qwen3asr_train_10000_dedup.jsonl"
     weight: 1  # ~31k samples
   - path: "../SpeechLMCorrector/data/synthesized_data_v3/kespeech_qwen3asr_train_1s_10000_dedup.jsonl"
