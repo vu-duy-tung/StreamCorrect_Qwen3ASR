@@ -38,20 +38,20 @@ train_audio_encoder: false
 # -----------------------------------------------------------------------------
 # Training Parameters
 # -----------------------------------------------------------------------------
-output_dir: "/data/mino/model_ckpts/waihu_2"
-num_train_epochs: 20
+output_dir: "/data/mino/model_ckpts/waihu_6"
+num_train_epochs: 8
 # NOTE: For 8B model, reduce batch size to fit in GPU memory
 # 1B model: batch_size=8 works on 24GB GPU
 # 8B model: batch_size=1-2 recommended on 24GB GPU, increase gradient_accumulation_steps
 per_device_train_batch_size: 4
 per_device_eval_batch_size: 4
 gradient_accumulation_steps: 4
-learning_rate: 1.0e-4 
+learning_rate: 2.0e-4 
 weight_decay: 0.05
 max_grad_norm: 1.0
 logging_steps: 15
-save_steps: 200
-eval_steps: 200
+save_steps: 300
+eval_steps: 300
 
 # Learning rate scheduler (following Ultravox's approach)
 # Options: linear, cosine, cosine_with_restarts, polynomial, constant, constant_with_warmup
@@ -65,7 +65,7 @@ warmup_ratio: 0.01  # Only used if warmup_steps is 0
 # If you encounter "Floating point exception", try setting both to false
 # fp16 generally works but may require specific GPU support
 fp16: false
-bf16: false
+bf16: true
 
 # Memory optimization
 # Note: gradient_checkpointing is HIGHLY RECOMMENDED for 8B model to reduce memory
@@ -121,14 +121,24 @@ wandb_tags:
 # Weight = integer multiplier for how many times samples are repeated per epoch.
 # All weighted samples are shuffled together before training.
 train_data_paths:
-  - path: "/home/duy/PlayWithMino/StreamCorrect/SpeechLMCorrector/data/sample_custom_data/waihu_qwen3asr_new.jsonl"
+  - path: "../SpeechLMCorrector/data/synthesized_data_v3/waihu_qwen3asr_train_dedup.jsonl"
+    weight: 3  # ~16k samples × 2 — upweighted to balance with larger KeSpeech/AISHELL sets
+  - path: "../SpeechLMCorrector/data/synthesized_data_v3/waihu_qwen3asr_train_1s_chunk_size_dedup.jsonl"
+    weight: 3
+  - path: "../SpeechLMCorrector/data/synthesized_data_v3/waihu_qwen3asr_test_dedup.jsonl"
     weight: 1
-  # - path: "SpeechLMCorrector/data/sample_custom_data/wsyue_test_500_4.jsonl"
-  #   weight: 2
+  - path: "../SpeechLMCorrector/data/synthesized_data_v3/kespeech_qwen3asr_train_10000_dedup.jsonl"
+    weight: 1  # ~31k samples
+  - path: "../SpeechLMCorrector/data/synthesized_data_v3/kespeech_qwen3asr_train_1s_10000_dedup.jsonl"
+    weight: 1
+  - path: "../SpeechLMCorrector/data/synthesized_data_v3/aishell_qwen3asr_train_10000_dedup.jsonl"
+    weight: 1  # ~30k samples
+  - path: "../SpeechLMCorrector/data/synthesized_data_v3/aishell_qwen3asr_train_1s_10000_dedup.jsonl"
+    weight: 1
 eval_data_path: null   # Set to your evaluation data path (optional)
 
 # Train/validation split settings
-train_val_split: 0.1   # Fraction of data to use for validation (0.0 to disable)
+train_val_split: 0.05   # Fraction of data to use for validation (0.0 to disable)
 shuffle_data: true     # Whether to shuffle data before splitting
 
 # Audio settings

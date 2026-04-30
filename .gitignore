@@ -1,4 +1,7 @@
 __pycache__/
+SpeechLMCorrector/data/
+SpeechLMCorrector/wandb/
+output/
 *.pyc
 *.pyo
 *.egg-info/

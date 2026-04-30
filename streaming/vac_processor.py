@@ -28,7 +28,7 @@ class VACProcessor(OnlineProcessorInterface):
         use_error_corrector=False,
         error_corrector_ckpt=None,
         error_corrector_base_model=None,
-        error_corrector_type="speechlm",  # "speechlm" or "lm"
+        error_corrector_type="speechlm",  # "speechlm", "lm", or "qwen3asr"
     ):
         self.online_chunk_size = online_chunk_size
         self.online = online
@@ -89,6 +89,42 @@ class VACProcessor(OnlineProcessorInterface):
                 )
                 self._corrector_model.eval()
                 logger.info("LM corrector loaded successfully")
+            elif error_corrector_type == "qwen3asr":
+                # Qwen3-ASR corrector (audio + text; training-aligned prompt in runtime script)
+                base_model_id = error_corrector_base_model or "Qwen/Qwen3-ASR-0.6B"
+                checkpoint_path = error_corrector_ckpt
+                if not checkpoint_path:
+                    raise ValueError(
+                        "--error-corrector-ckpt is required when --error-corrector-type qwen3asr"
+                    )
+                logger.info(f"Loading Qwen3-ASR corrector from {checkpoint_path}")
+
+                # Ensure qwen3_asr architecture is registered in AutoModel.
+                try:
+                    import qwen_asr as _qwen_asr  # noqa: F401
+                except ImportError as e:
+                    raise ImportError(
+                        "qwen_asr is required for --error-corrector-type qwen3asr"
+                    ) from e
+
+                self._corrector_processor = AutoProcessor.from_pretrained(
+                    base_model_id,
+                    trust_remote_code=True,
+                )
+                base_outer = AutoModel.from_pretrained(
+                    base_model_id,
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=False,
+                )
+                thinker = base_outer.thinker.to("cuda")
+                self._corrector_model = PeftModel.from_pretrained(
+                    thinker,
+                    checkpoint_path,
+                    is_trainable=False,
+                ).to("cuda")
+                self._corrector_model.eval()
+                logger.info("Qwen3-ASR corrector loaded successfully")
             else:
                 # SpeechLM corrector (audio + text, with LoRA)
                 base_model_id = error_corrector_base_model or "fixie-ai/ultravox-v0_5-llama-3_2-1b"
@@ -218,7 +254,7 @@ class VACProcessor(OnlineProcessorInterface):
     def process_iter(self, start_time=None):
         if self.is_currently_final:
             return self.finish(start_time=start_time)
-        elif self.current_online_chunk_buffer_size > self.SAMPLING_RATE * self.online_chunk_size:
+        elif self.current_online_chunk_buffer_size >= self.SAMPLING_RATE * self.online_chunk_size:
             self.current_online_chunk_buffer_size = 0
             ret = self.online.process_iter(
                 start_time=start_time,

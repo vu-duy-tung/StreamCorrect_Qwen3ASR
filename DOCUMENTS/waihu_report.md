@@ -75,6 +75,106 @@ These examples reflect the data distribution the corrector was trained on — Wa
 - Median FTL and LTL increase with the corrector (71ms→343ms and 42ms→165ms).
 ---
 
+---
+
+## Failure Analysis — Where the System Still Falls Short
+
+Evaluated on 684 matched utterances from the Waihu testset (with error corrector active).
+Overall CER is **13.3%**, with 470/684 utterances (68.7%) transcribed perfectly.
+The remaining 214 errors break down as follows.
+
+### Error categories
+
+| Category | Files | CER contribution |
+|---|---|---|
+| Substitution / deletion | 203 | 0.1164 (87% of total error) |
+| Hallucination / insertion | 7 | 0.0058 |
+| Repetition | 2 | 0.0010 |
+| Truncation | 2 | 0.0010 |
+
+Almost all damage is substitutions and deletions — the ASR transcribes something
+plausible but wrong, rather than generating garbage.
+
+### Short audio is the dominant failure driver
+
+Error rate climbs sharply as utterance length falls:
+
+| Reference length | Error count | Avg CER |
+|---|---|---|
+| 1–2 chars | 21 | 1.05 |
+| 3–4 chars | 41 | 0.61 |
+| 5–8 chars | 60 | 0.37 |
+| 9–15 chars | 48 | 0.26 |
+| 16+ chars | 44 | 0.22 |
+
+62 of the 214 errors are on utterances of 4 characters or fewer.
+Single-character utterances (`对`, `有`, `行`, `一`) are almost always wrong —
+the model cannot reliably distinguish them without sentence context.
+
+### Specific failure patterns
+
+**1. Leading truncation (initial-buffer timing)**
+
+The initial 1-second buffer gate sometimes discards the very start of an utterance
+before the buffer fills, causing the leading content to be lost:
+
+| Reference | Generated | CER |
+|---|---|---|
+| 一千二百三十四你好 | 你好 | 0.78 |
+| 三差五的就是收回二十多万 | 收回二十多万 | 0.50 |
+| 口袋里的钱比较预计今年年底 | 你预计今年年 | 0.62 |
+
+**2. English phrases in Chinese speech**
+
+Mixed Chinese/English is handled reasonably (CER 0.14–0.25),
+but a purely English phrase is semantically translated into Chinese rather than
+transcribed phonetically:
+
+| Reference | Generated | CER |
+|---|---|---|
+| the research | 做研究 | 1.00 |
+| sara电话 | 骚扰电话 | 0.25 |
+| ok反正总共... | okokok反正总共... | 0.22 |
+
+**3. Numbers and amounts**
+
+Numeric expressions are frequently truncated or mis-expanded:
+
+| Reference | Generated | CER |
+|---|---|---|
+| 百分之十八 | 十八 | 0.60 |
+| 三百四十九 | 三百四 | 0.40 |
+| 一百一十 | 金额 | 1.00 |
+
+**4. Domain-specific / low-frequency vocabulary**
+
+Rare company names and banking terms are rewritten as acoustically similar common phrases:
+
+| Reference | Generated | CER |
+|---|---|---|
+| 我行综合部 | 然后综合个 | 0.60 |
+| 就是金银福善 | 就是经营不善 | 0.50 |
+| 用于新的伤害后 | 你心有山海富利 | 1.00 |
+
+**5. Speaker disfluencies in reference**
+
+Some references contain genuine stuttering. The ASR normalises these, creating
+apparent errors against the literal reference:
+
+| Reference | Generated | CER |
+|---|---|---|
+| 我我我明明明 | 我我明天 | 0.50 |
+| 你给我等会儿你给我说方案了 | 你给我干不等会等会等我给我什么方案了 | 0.62 |
+
+### Summary
+
+The primary bottleneck is **short utterances (≤ 4 chars)**, where insufficient acoustic
+context makes reliable transcription impossible regardless of error corrector quality.
+Secondary issues — leading truncation, pure-English phrases, and domain-specific vocabulary —
+each affect a small number of files. The error corrector is largely not the bottleneck:
+in most failure cases, all ASR top-k candidates are wrong, leaving the corrector
+nothing correct to select from.
+
 ## How Qwen3-ASR Async Beam Search Works
 
 ### The latency problem with standard beam search

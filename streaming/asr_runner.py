@@ -144,6 +144,9 @@ def _worker_process_files(worker_id, gpu_id, audio_files, args_dict, factory_mod
         destroy_model_parallel()
     except Exception:
         pass
+    # Delete model objects so vLLM's __del__ releases GPU/semaphore resources
+    # before the process is forcibly killed in _process_wrapper.
+    del online, asr
     return results
 
 
@@ -154,6 +157,10 @@ def _process_wrapper(worker_id, gpu_id, files, arg_dict, fac_mod, fac_name, queu
         queue.put({worker_id: e})
         import traceback; traceback.print_exc()
     finally:
+        import logging as _log
+        # Silence vLLM's "engine core died" ERROR that fires when we
+        # terminate the engine's child process below.
+        _log.getLogger('vllm').setLevel(_log.CRITICAL)
         import multiprocessing
         for p in multiprocessing.active_children():
             p.terminate(); p.join(timeout=1)
@@ -172,6 +179,8 @@ def run_parallel_batch(audio_files, args, factory_module, factory_name, num_work
     queue = ctx.SimpleQueue()
     processes = []
     submitted = 0
+    import time as _time
+    STAGGER_SECS = 8  # prevent simultaneous vLLM engine init (GPU resource contention)
     for wid in range(num_workers):
         if worker_files[wid]:
             p = ctx.Process(target=_process_wrapper,
@@ -179,6 +188,8 @@ def run_parallel_batch(audio_files, args, factory_module, factory_name, num_work
                                   args_dict, factory_module, factory_name, queue),
                             daemon=False)
             p.start(); processes.append(p); submitted += 1
+            if wid < num_workers - 1:
+                _time.sleep(STAGGER_SECS)
     all_results = []
     for _ in range(submitted):
         try:

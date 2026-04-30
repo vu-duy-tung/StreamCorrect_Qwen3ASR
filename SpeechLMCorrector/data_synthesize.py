@@ -37,6 +37,7 @@ def run_batch_inference(
     gpus: str,
     num_workers: int,
     initial_buffer: float,
+    model: str,
 ) -> None:
     """Run batch streaming inference, writing per-file beam histories to batch_output_dir.
 
@@ -62,13 +63,14 @@ def run_batch_inference(
         "AUDIO_DIR": link_dir,
         "REFERENCE_FILE": reference_file,
         "OUTPUT_DIR": batch_output_dir,
-        "NUM_FILES": str(len(audio_paths)),
-        "VAC_CHUNK_SIZE": str(chunk_size / 1000.0),
-        "BEAM_SIZE": str(num_candidates),
-        "NUM_WORKERS": str(num_workers),
+        "MAX_FILES": str(len(audio_paths)),
+        "CHUNK_SIZE": str(chunk_size / 1000.0),
+        "BEAMS": str(num_candidates),
+        "WORKERS": str(num_workers),
         "GPUS": gpus,
+        "MODEL": model,
         "USE_ERROR_CORRECTOR": "false",
-        "HF_HUB_OFFLINE": "1",
+        "ERROR_CORRECTOR_CKPT": "",   # disable: batch script checks [ -n "$ERROR_CORRECTOR_CKPT" ]
         "INITIAL_BUFFER": str(initial_buffer),
     }
     print(f"  AUDIO_DIR:   {link_dir}")
@@ -128,31 +130,106 @@ def _normalize_text(s: str) -> str:
     s = _SPECIAL_TOKEN_RE.sub("", s)
     s = s.replace("\ufffd", "")
     return s
-def _align_prev_end(norm_prev: str, norm_ref: str) -> int:
-    """Return j* in [0, len(norm_ref)] that minimises edit_dist(norm_prev, norm_ref[:j*]).
+# ---------------------------------------------------------------------------
+# Alignment helpers — time-based primary, Smith-Waterman text fallback.
+# ---------------------------------------------------------------------------
 
-    Semi-global Needleman-Wunsch: norm_prev is fully consumed, norm_ref end is free.
-    Ties broken toward j closest to len(norm_prev).
+def _cache_path(audio_path: str) -> str:
+    return audio_path + ".align.json"
+
+
+def _load_align_cache(audio_path: str):
+    import json as _json, os as _os
+    p = _cache_path(audio_path)
+    if not _os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as fh:
+            return _json.load(fh)
+    except Exception:
+        return None
+
+
+def _is_punct_space(ch: str) -> bool:
+    import unicodedata as _ud
+    return ch.isspace() or _ud.category(ch).startswith("P")
+
+
+def _align_by_time(end_time_sec: float, align_cache: list) -> int:
+    """Linear scan: return gt char index after the last char whose end <= end_time_sec."""
+    result = 0
+    for entry in align_cache:
+        if entry["end"] <= end_time_sec:
+            result = entry["pos"] + 1
+    return result
+
+
+def _align_span_by_time(start_time_sec: float, end_time_sec: float, align_cache: list) -> tuple[int, int]:
+    """Return [start_pos, end_pos) char span for a chunk time window.
+
+    start_pos is the first character whose end is strictly after start_time_sec.
+    end_pos   is the first character after all chars whose end <= end_time_sec.
     """
-    n, m = len(norm_prev), len(norm_ref)
-    if not n or not m:
+    if end_time_sec < start_time_sec:
+        end_time_sec = start_time_sec
+    start_pos = _align_by_time(start_time_sec, align_cache)
+    end_pos = _align_by_time(end_time_sec, align_cache)
+    if end_pos < start_pos:
+        end_pos = start_pos
+    return start_pos, end_pos
+
+
+def _align_by_text_fallback(prev_text: str, gt_text: str) -> int:
+    """Fitting alignment: find where prev_text ends in gt_text.
+
+    Smith-Waterman DP with punctuation-aware gap costs:
+      +2 exact match, +1 NFKC-normalised match, -1 gap in query,
+      0 gap for punct/space in gt_text, -1 gap for other gt chars.
+    Strict > update so ties go to the earliest j (no over-extension).
+    """
+    if not prev_text or not gt_text:
         return 0
-    prev_row = list(range(m + 1))
-    for i, pc in enumerate(norm_prev, start=1):
-        curr = [i] + [0] * m
-        for j, rc in enumerate(norm_ref, start=1):
-            curr[j] = min(
-                prev_row[j - 1] + (0 if pc == rc else 1),
-                prev_row[j] + 1,
-                curr[j - 1] + 1,
-            )
-        prev_row = curr
-    best_j, best_val = 0, prev_row[0]
+    import unicodedata as _ud
+    GAP = -1.0
+    n, m = len(prev_text), len(gt_text)
+
+    def _sc(a, b):
+        if a == b: return 2.0
+        a2 = _ud.normalize("NFKC", a).lower()
+        b2 = _ud.normalize("NFKC", b).lower()
+        return 1.0 if (a2 and b2 and a2 == b2) else -1.0
+
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i-1][0] + GAP
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            gt_ch = gt_text[j-1]
+            match = dp[i-1][j-1] + _sc(prev_text[i-1], gt_ch)
+            gap_q = dp[i-1][j]   + GAP
+            gap_t = dp[i][j-1]   + (0.0 if _is_punct_space(gt_ch) else GAP)
+            dp[i][j] = max(match, gap_q, gap_t)
+
+    best_j, best_score = 0, dp[n][0]
     for j in range(1, m + 1):
-        v = prev_row[j]
-        if v < best_val or (v == best_val and abs(j - n) < abs(best_j - n)):
-            best_val, best_j = v, j
+        if dp[n][j] > best_score:
+            best_score = dp[n][j]
+            best_j = j
     return best_j
+
+
+def _align_prev_end(prev_text: str, norm_ref: str,
+                    end_time: float | None = None,
+                    align_cache: list | None = None) -> int:
+    """Find where prev_text ends in norm_ref.
+
+    Primary : time-based lookup via Qwen3-ForcedAligner cache (.align.json).
+    Fallback: Smith-Waterman fitting alignment with punct-aware gap costs.
+    """
+    if end_time is not None and align_cache:
+        if any(e["end"] > 0.0 for e in align_cache):
+            return _align_by_time(end_time, align_cache)
+    return _align_by_text_fallback(prev_text, norm_ref)
 
 
 def synthesize_samples(
@@ -168,11 +245,8 @@ def synthesize_samples(
     For each history entry:
       1. Normalize prev and top-k candidates.
       2. Compute chunk duration (end_time of current entry minus end_time of previous).
-         For the first entry the duration equals end_time directly.
-      3a. Short chunk (duration < initial_buffer for first entry, < chunk_size_s for
-          later entries): audio has run out after this chunk, so use norm_ref[end_pos:]
-          as the continuation (everything from the alignment point to the end).
-      3b. Normal chunk: align norm_prev against norm_ref, slice pred_len chars.
+      3. Use forced-aligner timestamps to map the chunk window
+         [prev_end_time, end_time] to a character span in reference text.
     """
     if not ref:
         return []
@@ -182,6 +256,14 @@ def synthesize_samples(
 
     chunk_size_s = chunk_size / 1000.0
     samples: list[dict[str, Any]] = []
+    _seen_keys: set = set()
+    _align_cache = _load_align_cache(audio_path)
+    has_time_cache = bool(_align_cache) and any(e.get("end", 0.0) > 0.0 for e in _align_cache)
+    if not has_time_cache:
+        # For unfixed_token_num=0 synthesis, continuation targets are defined by
+        # chunk time windows. Skip files without forced-align caches.
+        return []
+
     for i, entry in enumerate(beam_history):
         norm_prev = _normalize_text(entry.get("previous_transcript") or "")
         norm_topk = [
@@ -195,28 +277,22 @@ def synthesize_samples(
 
         end_time = float(entry.get("end_time", 0.0))
         prev_end_time = float(beam_history[i - 1].get("end_time", 0.0)) if i > 0 else 0.0
-        chunk_duration = end_time - prev_end_time
-        threshold = initial_buffer if i == 0 else chunk_size_s
-        is_short_chunk = chunk_duration < threshold
-
-        end_pos = _align_prev_end(norm_prev, norm_ref)
-        if end_pos >= len(norm_ref):
+        start_pos, end_pos = _align_span_by_time(prev_end_time, end_time, _align_cache)
+        if start_pos >= len(norm_ref):
+            continue
+        continuation = norm_ref[start_pos:end_pos]
+        if not continuation:
             continue
 
-        if is_short_chunk:
-            continuation = norm_ref[end_pos:]
-        else:
-            pred_len = len(norm_topk[0]) - len(norm_prev)
-            if pred_len <= 0:
-                continue
-            continuation = norm_ref[end_pos : end_pos + pred_len]
-            if not continuation:
-                continue
-
+        _key = (norm_prev, float(entry.get("end_time", 0.0)))
+        if _key in _seen_keys:
+            continue
+        _seen_keys.add(_key)
         samples.append({
             "k_best_candidates": norm_topk,
             "num_candidates": num_candidates,
             "chunk_size": chunk_size,
+            "initial_buffer": initial_buffer,
             "previous_transcript": norm_prev,
             "continuation_transcript": continuation,
             "audio_path": audio_path,
@@ -290,6 +366,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Output filename inside --output-dir")
     p.add_argument("--batch-script", default="runs/run_batch_eval_qwen3asr_vllm.sh",
                    help="Path to the batch evaluation shell script")
+    p.add_argument("--model", default="Qwen/Qwen3-ASR-1.7B",
+                   help="ASR model id/path passed to the batch script via MODEL env")
     p.add_argument("--gpus", default="0,1,2,3,4,5",
                    help="Comma-separated GPU indices passed to the batch script")
     p.add_argument("--num-workers", type=int, default=0,
@@ -303,6 +381,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--initial-buffer", type=float, default=1.0,
                    help="Initial audio buffer size in seconds before first inference")
     p.add_argument("--seed", type=int, default=21)
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Incremental mode: skip audio paths that already exist in output JSONL")
     p.add_argument("--keep-batch-output", action="store_true",
                    help="Keep the temporary batch output directory after synthesis")
     return p
@@ -316,6 +396,11 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     output_path = os.path.join(args.output_dir, args.output_file)
     failed_log = os.path.join(args.output_dir, "failed_audio.txt")
+    # Fresh-run default: rerun selected files and rewrite output to avoid stale
+    # samples when ASR/inference logic changes between runs.
+    if not args.skip_existing and os.path.exists(output_path):
+        os.remove(output_path)
+        print(f"Removed existing output for fresh regeneration: {output_path}")
 
     existing_paths = load_existing_audio_paths(output_path)
     print(f"Existing output: {len(existing_paths)} audio paths ({output_path})")
@@ -349,6 +434,7 @@ def main() -> None:
         gpus=args.gpus,
         num_workers=num_workers,
         initial_buffer=args.initial_buffer,
+        model=args.model,
     )
 
     print("\nSynthesizing training samples from beam histories ...")
@@ -385,7 +471,13 @@ def main() -> None:
         print(f"\nWARNING: {len(missing)} files had no beam_history.json (see {failed_log})")
 
     if not args.keep_batch_output:
-        shutil.rmtree(batch_output_dir, ignore_errors=True)
+        # Remove per-file beam histories and audio symlinks; keep evaluation_results.json
+        link_dir = os.path.join(batch_output_dir, "_audio_links")
+        if os.path.exists(link_dir):
+            shutil.rmtree(link_dir, ignore_errors=True)
+        for fname in os.listdir(batch_output_dir):
+            if fname.endswith("_beam_history.json"):
+                os.remove(os.path.join(batch_output_dir, fname))
 
     print(f"\n{total} samples written to {output_path}")
 

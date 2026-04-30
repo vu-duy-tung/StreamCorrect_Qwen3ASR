@@ -42,6 +42,11 @@ LANG_CODE_TO_NAME = {
 # ---------------------------------------------------------------------------
 
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
+_QWEN3ASR_CORRECTOR_SYSTEM_PROMPT = (
+    "You are an ASR error corrector. "
+    "Listen to the audio and, given the k-best hypotheses below, "
+    "output the single best corrected transcript for this audio segment."
+)
 
 
 def _normalize_text(s):
@@ -51,6 +56,60 @@ def _normalize_text(s):
     s = _SPECIAL_TOKEN_RE.sub("", s)
     s = s.replace("\ufffd", "")
     return s
+
+
+def _strip_intermediate_tail_artifacts(text: str) -> str:
+    """Strip unstable trailing artifacts for intermediate chunk hypotheses.
+
+    Applied only during process_iter() (not finish()):
+    - trailing special tokens like <|...|>
+    - trailing whitespace
+    - trailing punctuation/control/separator chars
+    """
+    if not text:
+        return ""
+
+    s = text
+    while True:
+        changed = False
+
+        # Remove trailing model special tokens.
+        m = re.search(r"<\|[^|]*\|>\s*$", s)
+        if m is not None:
+            s = s[:m.start()]
+            changed = True
+
+        # Remove trailing whitespace/punctuation/control/separator chars.
+        while s:
+            ch = s[-1]
+            cat = unicodedata.category(ch)
+            if ch == "\ufffd" or ch.isspace() or cat.startswith(("P", "C", "Z")):
+                s = s[:-1]
+                changed = True
+            else:
+                break
+
+        if not changed:
+            break
+
+    return s
+
+
+def _build_qwen3asr_candidates_text(candidates):
+    body = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(candidates)) + "\n"
+    return f"<candidates>\n{body}</candidates>"
+
+
+def _build_qwen3asr_corrector_prompt(candidates, previous_text):
+    user_body = "<|audio_start|><|audio_pad|><|audio_end|>\n"
+    if previous_text:
+        user_body += f"Previous: {previous_text}\n"
+    user_body += _build_qwen3asr_candidates_text(candidates)
+    return (
+        f"<|im_start|>system\n{_QWEN3ASR_CORRECTOR_SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\n{user_body}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
 
 
 def qwen3asr_args(parser):
@@ -83,8 +142,8 @@ def qwen3asr_args(parser):
         help='Base model for the error corrector (required for LoRA checkpoints).',
     )
     ec.add_argument(
-        '--error-corrector-type', type=str, choices=['speechlm', 'lm'], default='speechlm',
-        help='Corrector type: "speechlm" (audio+text, default) or "lm" (text-only).',
+        '--error-corrector-type', type=str, choices=['speechlm', 'lm', 'qwen3asr'], default='speechlm',
+        help='Corrector type: "speechlm" (audio+text), "lm" (text-only), or "qwen3asr" (Qwen3-ASR-0.6B LoRA).',
     )
 
 
@@ -144,8 +203,8 @@ class Qwen3ASRBackendASR(ASRBase):
         import numpy as np
         return {
             'chunk_id': 0,
-            'unfixed_chunk_num': 2,
-            'unfixed_token_num': 3,
+            'unfixed_chunk_num': 0,
+            'unfixed_token_num': 2,
             'audio_accum': np.zeros(0, dtype=np.float32),
             '_raw_decoded': ''
         }
@@ -174,7 +233,12 @@ class Qwen3ASRBackendASR(ASRBase):
         try:
             candidates, best_raw, beam_prefix = self._beam_search(state['audio_accum'], state, self.beams)
             if candidates and len(candidates) > 0:
-                state['_raw_decoded'] = _normalize_text(best_raw)
+                next_raw = _normalize_text(best_raw)
+                # For intermediate streaming chunks, keep the carry-over prefix
+                # conservative by removing unstable tail artifacts.
+                if not is_last:
+                    next_raw = _strip_intermediate_tail_artifacts(next_raw)
+                state['_raw_decoded'] = next_raw
                 state['chunk_id'] += 1
         except Exception as e:
             import traceback
@@ -256,9 +320,11 @@ class Qwen3ASRBackendASR(ASRBase):
 
         eos_id = tokenizer.eos_token_id
         # Treat <|im_end|>, <|endoftext|>, <|im_start|> as stop tokens to avoid continuation hallucinations.
+        # <think> and </think> are Qwen3 thinking-mode tokens; stop immediately if the model
+        # spontaneously emits them so they never appear in ASR candidates.
         stop_ids = set()
         if eos_id is not None: stop_ids.add(eos_id)
-        for _tkn in ("<|im_end|>", "<|endoftext|>", "<|im_start|>"):
+        for _tkn in ("<|im_end|>", "<|endoftext|>", "<|im_start|>", "<think>", "</think>"):
             _id = tokenizer.convert_tokens_to_ids(_tkn)
             if _id is not None and _id >= 0: stop_ids.add(_id)
 
@@ -390,13 +456,21 @@ class Qwen3ASRBackendASR(ASRBase):
                 if t in stop_ids:
                     break
                 clean_toks.append(t)
-            new_text = tokenizer.decode(clean_toks, skip_special_tokens=False)
-            new_text = new_text.replace("<|im_end|>", "")
+            new_text = tokenizer.decode(clean_toks, skip_special_tokens=True)
             raw_complete = prefix + new_text
             if i == 0:
                 best_raw_decoded = raw_complete
             _, text = parse_asr_output(raw_complete, user_language=self.force_language)
-            candidates.append(text.strip())
+            # Off-distribution alternative beam paths hallucinate a format restart after
+            # the real transcript: "...句。[ \t\n]+language Chinese<asr_text>重复" or
+            # "...句。\n```python...". Strip everything from the first whitespace-preceded
+            # "language X<asr_text>" and from any "\n```" code-block start.
+            # Strip any "language X<asr_text>" restart anywhere — with or without
+            # preceding whitespace (alternative beams append it directly after 。).
+            text = re.sub(r'[ \t\n]*language\s+\S+<asr_text>.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'\n`{3}.*', '', text, flags=re.DOTALL)
+            text = text.strip()
+            candidates.append(text)
 
         logger.info(f'[Qwen3-ASR vLLM block-beam] {len(candidates)} candidates (block_size={BLOCK_SIZE}):')
         for i, cc in enumerate(candidates):
@@ -504,18 +578,29 @@ class Qwen3ASROnline(OnlineProcessorInterface):
         candidates, self.streaming_state, beam_prefix = self.asr.infer_chunk(feed_audio, self.streaming_state, is_last=False)
 
         if candidates:
-            self.last_candidates = candidates
+            self.last_candidates = candidates  # keep full for finish() fallback
+            beam_prefix = _strip_intermediate_tail_artifacts(beam_prefix)
             self.last_beam_prefix = beam_prefix
 
-            # Run error corrector chunk-by-chunk (matching training format):
-            # previous_text = previous[:-k] (the fixed prefix used by beam search)
-            # candidates = full transcripts starting from that prefix
-            # The corrector returns a suffix to append after previous_text.
-            corrected_top1 = candidates[0]  # default: raw top-1
+            # Strip the unfixed tail tokens from each candidate before beam history and
+            # error corrector. Mid-stream hypotheses always end with sentence-final
+            # punctuation (pseudo-streaming artefact); stripping unfixed_token_num tokens
+            # removes it and aligns with the training data format.
+            # self.last_candidates retains the full text so finish() is unaffected.
+            unfixed_n = int(self.streaming_state.get("unfixed_token_num", 0))
+            _tok = self.asr.qwen3.processor.tokenizer
+            hist_candidates = _strip_tail_tokens(candidates, unfixed_n, _tok)
+            hist_candidates = [_strip_intermediate_tail_artifacts(c) for c in hist_candidates]
+            hist_candidates = [c for c in hist_candidates if c]
+            if not hist_candidates:
+                hist_candidates = [_strip_intermediate_tail_artifacts(candidates[0])]
+                hist_candidates = [c for c in hist_candidates if c] or [candidates[0]]
+
+            corrected_top1 = hist_candidates[0] if hist_candidates else candidates[0]
             if corrector_model is not None and all_audio_arr.shape[0] >= 1600:
                 corrected_suffix = _run_error_corrector(
                     audio_np=all_audio_arr,
-                    candidates=candidates,
+                    candidates=hist_candidates,
                     previous_text=beam_prefix,
                     corrector_model=corrector_model,
                     corrector_processor=corrector_processor,
@@ -525,10 +610,10 @@ class Qwen3ASROnline(OnlineProcessorInterface):
                     corrected_top1 = beam_prefix + corrected_suffix
 
             self._beam_history.append({
-                'end_time': float(self.end),
-                'previous_transcript': str(beam_prefix),
-                'topk': list(candidates),
-                'source': 'process_iter',
+                "end_time": float(self.end),
+                "previous_transcript": str(beam_prefix),
+                "topk": list(hist_candidates),
+                "source": "process_iter",
             })
             self._last_top1_in_segment = corrected_top1 if corrected_top1 else self._last_top1_in_segment
 
@@ -542,13 +627,19 @@ class Qwen3ASROnline(OnlineProcessorInterface):
         new_audio = np.concatenate(self.pending_audio, axis=0) if self.pending_audio else None
         self.pending_audio = []
 
+        # Compute the true end time from all accumulated audio up front so that
+        # the beam_history entry records the correct end_time (previously self.end
+        # was only updated in process_iter, causing finish() to emit a duplicate
+        # or 0.0 timestamp).
+        all_audio_arr = np.concatenate(self.all_audio, axis=0) if self.all_audio else np.zeros((0,), dtype=np.float32)
+        self.end = self.offset + all_audio_arr.shape[0] / self.SAMPLING_RATE
+
         # On final flush: if initial-buffer was never filled via process_iter
         # (audio shorter than initial_buffer), feed the full accumulated speech
         # audio instead of just the trailing fragment so infer_chunk sees the
         # whole utterance.
         if not self._initial_buffer_done:
             self._initial_buffer_done = True
-            all_audio_arr = np.concatenate(self.all_audio, axis=0) if self.all_audio else np.zeros((0,), dtype=np.float32)
             if all_audio_arr.shape[0] > 0:
                 new_audio = all_audio_arr
 
@@ -567,8 +658,6 @@ class Qwen3ASROnline(OnlineProcessorInterface):
             # Note: _last_top1_in_segment will be updated below after
             # the corrector runs (if enabled), so we don't set it from
             # the raw candidate here.
-
-        all_audio_arr = np.concatenate(self.all_audio, axis=0) if self.all_audio else np.zeros((0,))
 
         norm_committed = self.committed_text
 
@@ -637,6 +726,29 @@ class Qwen3ASROnline(OnlineProcessorInterface):
 # Error corrector
 # ---------------------------------------------------------------------------
 
+def _strip_tail_tokens(candidates: list, n_tokens: int, tokenizer) -> list:
+    """Strip the last n_tokens from each decoded candidate string.
+
+    Applied in process_iter (is_last=False) to remove the unfixed tail before
+    recording beam history and before passing to the error corrector.
+    The full candidates are kept separately as self.last_candidates so that
+    finish() can still use them as a fallback without truncation.
+    """
+    result = []
+    for c in candidates:
+        ids = tokenizer.encode(c, add_special_tokens=False)
+        end_idx = max(0, len(ids) - n_tokens)
+        if end_idx == 0:
+            result.append("")
+            continue
+        decoded = tokenizer.decode(ids[:end_idx])
+        while "�" in decoded and end_idx > 0:
+            end_idx -= 1
+            decoded = tokenizer.decode(ids[:end_idx]) if end_idx > 0 else ""
+        result.append(decoded)
+    return result
+
+
 def _token_confidence(gen_out, new_token_ids):
     """Mean log-prob of generated tokens (requires return_dict_in_generate=True)."""
     if not hasattr(gen_out, 'scores') or not gen_out.scores:
@@ -652,7 +764,7 @@ def _run_error_corrector(
     corrector_model, corrector_processor, corrector_type,
     return_confidence=False,
 ):
-    """Run the SpeechLM or LM error corrector on top-k beam search candidates."""
+    """Run the SpeechLM, LM, or Qwen3-ASR corrector on top-k candidates."""
     prev_display = previous_text
     while prev_display.endswith('\ufffd'):
         prev_display = prev_display[:-1]
@@ -696,6 +808,64 @@ def _run_error_corrector(
         confidence = _token_confidence(gen_out, gen[0, input_length:]) if return_confidence else None
 
         print('============ LM CORRECTOR =============')
+        print(f'Previous: {prev_display}')
+        print(f'Candidates: {cleaned}')
+        print(f'Corrected suffix: {response}')
+        print('=======================================')
+        return (response, confidence) if return_confidence else response
+
+    # ---- Qwen3-ASR corrector (audio + text, aligned with Qwen3ASRCorrector training) ----
+    if corrector_type == 'qwen3asr':
+        prompt = _build_qwen3asr_corrector_prompt(cleaned, prev_display)
+        audio_array = np.asarray(audio_np, dtype=np.float32)
+        if audio_array.ndim > 1:
+            audio_array = audio_array.mean(axis=0) if audio_array.shape[0] <= 2 else audio_array[0]
+
+        inputs = corrector_processor(
+            text=[prompt],
+            audio=[audio_array],
+            sampling_rate=16000,
+            padding=True,
+            return_tensors='pt',
+        )
+
+        model_device = next(corrector_model.parameters()).device
+        inputs = {
+            k: v.to(model_device) if isinstance(v, torch.Tensor) else v
+            for k, v in inputs.items()
+        }
+
+        tokenizer = corrector_processor.tokenizer
+        eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if eos_id is None or eos_id < 0:
+            eos_id = tokenizer.eos_token_id
+        if eos_id is None:
+            eos_id = tokenizer.pad_token_id
+
+        with torch.no_grad():
+            gen_out = corrector_model.generate(
+                **inputs,
+                max_new_tokens=64,
+                do_sample=False,
+                output_scores=return_confidence,
+                return_dict_in_generate=return_confidence,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=eos_id,
+            )
+
+        gen = gen_out.sequences if return_confidence else gen_out
+        input_length = inputs['input_ids'].shape[1]
+        new_tokens = gen[0, input_length:]
+
+        stop_at = len(new_tokens)
+        for i, tid in enumerate(new_tokens.tolist()):
+            if tid == eos_id:
+                stop_at = i
+                break
+        response = tokenizer.decode(new_tokens[:stop_at], skip_special_tokens=True).strip()
+        confidence = _token_confidence(gen_out, gen[0, input_length:]) if return_confidence else None
+
+        print('========= QWEN3ASR CORRECTOR ==========')
         print(f'Previous: {prev_display}')
         print(f'Candidates: {cleaned}')
         print(f'Corrected suffix: {response}')
