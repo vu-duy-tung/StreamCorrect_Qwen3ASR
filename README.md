@@ -22,7 +22,7 @@ unzip -q ver1.zip && unzip -q ver2.zip
 cd ..
 ```
 
-Use the extracted directory as `ERROR_CORRECTOR_CKPT`. Replace `/path/to/checkpoint` in the examples below with e.g. **`$(pwd)/streamcorrect_ckpts/ver1_ckpt`** or **`$(pwd)/streamcorrect_ckpts/ver2_ckpt`** (absolute paths are fine too).
+Use the extracted directory as `ERROR_CORRECTOR_CKPT`.
 
 ```bash
 AUDIO_DIR=/path/to/wav_dir \
