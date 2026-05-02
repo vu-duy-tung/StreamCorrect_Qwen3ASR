@@ -2,6 +2,8 @@
 
 Streaming ASR using Qwen3-ASR-1.7B with block-wise async beam search, with optional SpeechLM error corrector.
 
+- [ ] Optimize the fine-tuning of Qwen3-ASR-0.6B on error correction data, document for current implementation can be read [here](DOCUMENTS/QWEN-CORRECTOR.md)
+
 ---
 
 ## Pretrained SpeechLM corrector checkpoints
