@@ -4,7 +4,9 @@ Pipeline
 --------
 1. Collect .wav files from a training folder.
 2. Run batch streaming inference (no error corrector) to produce per-file beam histories.
-3. Align each beam candidate against the ground-truth reference and emit
+3. For files missing `<wav>.align.json`, run Qwen3-ForcedAligner (same as precompute_alignments.py)
+   and write caches next to each WAV (--no-inline-forced-align skips this step).
+4. Align each beam candidate against the ground-truth reference and emit
    (previous_transcript, k_best_candidates, continuation_transcript) triples
    for use in SpeechLM / LM corrector training.
 """
@@ -17,10 +19,24 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import unicodedata
+from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _ensure_repo_root_on_path() -> None:
+    root = str(_REPO_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def _parse_gpu_ids(gpus_csv: str) -> list[int]:
+    return [int(g.strip()) for g in gpus_csv.split(",") if g.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +166,10 @@ def _load_align_cache(audio_path: str):
         return None
 
 
+def _align_cache_has_timestamps(cache: list | None) -> bool:
+    return bool(cache) and any(float(e.get("end") or 0.0) > 0.0 for e in cache)
+
+
 def _is_punct_space(ch: str) -> bool:
     import unicodedata as _ud
     return ch.isspace() or _ud.category(ch).startswith("P")
@@ -239,6 +259,7 @@ def synthesize_samples(
     num_candidates: int,
     chunk_size: int,
     initial_buffer: float,
+    align_cache: list | None = None,
 ) -> list[dict[str, Any]]:
     """Convert one file's beam history into error-correction training samples.
 
@@ -257,8 +278,8 @@ def synthesize_samples(
     chunk_size_s = chunk_size / 1000.0
     samples: list[dict[str, Any]] = []
     _seen_keys: set = set()
-    _align_cache = _load_align_cache(audio_path)
-    has_time_cache = bool(_align_cache) and any(e.get("end", 0.0) > 0.0 for e in _align_cache)
+    _align_cache = align_cache if align_cache is not None else _load_align_cache(audio_path)
+    has_time_cache = _align_cache_has_timestamps(_align_cache)
     if not has_time_cache:
         # For unfixed_token_num=0 synthesis, continuation targets are defined by
         # chunk time windows. Skip files without forced-align caches.
@@ -313,19 +334,21 @@ def _append_samples(samples: list[dict[str, Any]], output_path: str) -> None:
             f.write(json.dumps(sample, ensure_ascii=False) + "\n")
 
 
-def load_existing_audio_paths(jsonl_path: str) -> list[str]:
-    """Return audio paths already present in an existing output .jsonl file."""
+def load_existing_audio_paths(jsonl_path: str) -> set[str]:
+    """Return distinct audio paths already present in an existing output .jsonl file."""
     audio_paths: set[str] = set()
     if not os.path.exists(jsonl_path):
-        return []
+        return audio_paths
     with open(jsonl_path, encoding="utf-8") as f:
         for line in f:
             try:
                 s = json.loads(line.strip())
             except json.JSONDecodeError:
                 continue
-            audio_paths.add(s["audio_path"])
-    return list(audio_paths)
+            ap = s.get("audio_path")
+            if isinstance(ap, str) and ap:
+                audio_paths.add(ap)
+    return audio_paths
 
 
 def collect_audio_paths(folder: str) -> list[str]:
@@ -377,14 +400,39 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-candidates", type=int, default=4,
                    help="Beam width / number of top-k candidates to store")
     p.add_argument("--max-files", type=int, default=10000,
-                   help="Randomly sample at most this many files (0 = no limit)")
+                   help="Target total number of distinct audio files in the output "
+                        "(--max-files 0 = no cap). When resuming, only enough new files "
+                        "are sampled to reach this total.")
     p.add_argument("--initial-buffer", type=float, default=1.0,
                    help="Initial audio buffer size in seconds before first inference")
     p.add_argument("--seed", type=int, default=21)
-    p.add_argument("--skip-existing", action="store_true",
-                   help="Incremental mode: skip audio paths that already exist in output JSONL")
+    p.add_argument("--overwrite-output", action="store_true",
+                   help="Delete existing output JSONL before running (fresh run). "
+                        "Default is to append: skip audios already present and fill up to "
+                        "--max-files.")
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--keep-batch-output", action="store_true",
                    help="Keep the temporary batch output directory after synthesis")
+    p.add_argument(
+        "--no-inline-forced-align",
+        action="store_true",
+        help="Do not run Qwen3-ForcedAligner when .align.json is missing (those files are skipped).",
+    )
+    p.add_argument(
+        "--align-batch-size",
+        type=int,
+        default=8,
+        help="Audios per align() batch per GPU for inline forced alignment (default: 8).",
+    )
+    p.add_argument(
+        "--align-language",
+        default="Chinese",
+        help="Language argument passed to Qwen3-ForcedAligner for inline alignment.",
+    )
     return p
 
 
@@ -396,23 +444,44 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     output_path = os.path.join(args.output_dir, args.output_file)
     failed_log = os.path.join(args.output_dir, "failed_audio.txt")
-    # Fresh-run default: rerun selected files and rewrite output to avoid stale
-    # samples when ASR/inference logic changes between runs.
-    if not args.skip_existing and os.path.exists(output_path):
+
+    if args.overwrite_output and os.path.exists(output_path):
         os.remove(output_path)
-        print(f"Removed existing output for fresh regeneration: {output_path}")
+        print(f"Removed existing output (--overwrite-output): {output_path}")
 
     existing_paths = load_existing_audio_paths(output_path)
-    print(f"Existing output: {len(existing_paths)} audio paths ({output_path})")
+    n_existing = len(existing_paths)
+    print(f"Existing output: {n_existing} distinct audio file(s) in {output_path}")
 
     all_audio = collect_audio_paths(args.audio_dir)
     print(f"Found {len(all_audio)} audio files in {args.audio_dir}")
     done_basenames = {os.path.basename(p) for p in existing_paths}
-    audio_paths = [ap for ap in all_audio if os.path.basename(ap) not in done_basenames]
-    print(f"After filtering already-processed: {len(audio_paths)} files to process")
-    if args.max_files and len(audio_paths) > args.max_files:
-        audio_paths = random.sample(audio_paths, args.max_files)
-        print(f"Sampled {len(audio_paths)} files (--max-files {args.max_files})")
+    pool = [ap for ap in all_audio if os.path.basename(ap) not in done_basenames]
+    print(f"Not yet in output JSONL: {len(pool)} file(s) in --audio-dir")
+
+    if args.max_files > 0:
+        target_total = args.max_files
+        need = max(0, target_total - n_existing)
+        take = min(need, len(pool))
+        if need == 0:
+            print(
+                f"Already at or above --max-files ({target_total}) distinct audios "
+                f"({n_existing} in file). Nothing to do."
+            )
+            return
+        if take < need:
+            print(
+                f"WARNING: only {take} file(s) available in pool but need {need} "
+                f"to reach --max-files {target_total}."
+            )
+        audio_paths = random.sample(pool, take) if take < len(pool) else list(pool)
+        print(
+            f"Sampling {len(audio_paths)} new file(s) "
+            f"(target total distinct audios: {target_total}, already have {n_existing})."
+        )
+    else:
+        audio_paths = pool
+        print(f"Processing all {len(audio_paths)} file(s) not yet in output (no --max-files cap).")
 
     if not audio_paths:
         print("No new audio files to process. Exiting.")
@@ -441,12 +510,50 @@ def main() -> None:
     refs_and_histories = load_per_file_outputs(batch_output_dir)
     path_by_basename = {os.path.basename(p): p for p in audio_paths}
 
+    if not args.no_inline_forced_align:
+        align_todo: list[dict[str, str]] = []
+        for basename, (ref, history) in refs_and_histories.items():
+            if ref is None:
+                continue
+            real_path = path_by_basename.get(basename, basename)
+            if _align_cache_has_timestamps(_load_align_cache(real_path)):
+                continue
+            align_todo.append({"audio_path": real_path, "text": ref})
+        if align_todo:
+            gpu_ids = _parse_gpu_ids(args.gpus)
+            if not gpu_ids:
+                print(
+                    "WARNING: empty --gpus; cannot run inline forced alignment. "
+                    "Use --no-inline-forced-align to silence."
+                )
+            else:
+                print(
+                    f"\nInferring {len(align_todo)} missing `<wav>.align.json` cache(s) "
+                    f"(Qwen3-ForcedAligner on GPU(s) {','.join(map(str, gpu_ids))}) …"
+                )
+                _ensure_repo_root_on_path()
+                from precompute_alignments import run_forced_alignment_jobs
+
+                run_forced_alignment_jobs(
+                    align_todo,
+                    gpu_ids,
+                    args.align_language,
+                    args.align_batch_size,
+                )
+
     total = 0
+    skipped_no_align = 0
     with tqdm(total=len(refs_and_histories), desc="Aligning", unit="file") as pbar:
         for basename, (ref, history) in refs_and_histories.items():
             real_path = path_by_basename.get(basename, basename)
             if ref is None:
                 _log_failed(real_path, failed_log)
+                pbar.update(1)
+                continue
+
+            loaded_align = _load_align_cache(real_path)
+            if not _align_cache_has_timestamps(loaded_align):
+                skipped_no_align += 1
                 pbar.update(1)
                 continue
 
@@ -457,6 +564,7 @@ def main() -> None:
                 num_candidates=args.num_candidates,
                 chunk_size=args.chunk_size,
                 initial_buffer=args.initial_buffer,
+                align_cache=loaded_align,
             )
 
             _append_samples(samples, output_path)
@@ -469,6 +577,17 @@ def main() -> None:
         _log_failed(p, failed_log)
     if missing:
         print(f"\nWARNING: {len(missing)} files had no beam_history.json (see {failed_log})")
+
+    if skipped_no_align:
+        hint = (
+            "run precompute_alignments.py or remove --no-inline-forced-align."
+            if args.no_inline_forced_align
+            else "alignment failed for those paths (see precompute_alignments logs above)."
+        )
+        print(
+            f"\nWARNING: {skipped_no_align} file(s) had ASR beam history but were skipped "
+            f"because `<audio>.align.json` is missing or has no timestamps ({hint})"
+        )
 
     if not args.keep_batch_output:
         # Remove per-file beam histories and audio symlinks; keep evaluation_results.json

@@ -189,6 +189,70 @@ def _process_batch(aligner, batch: list[dict], language: str) -> None:
             logger.warning("Cache write failed %s: %s", entry["audio_path"], exc)
 
 
+def run_forced_alignment_jobs(
+    todo: list[dict],
+    gpus: list[int],
+    language: str,
+    batch_size: int,
+) -> None:
+    """Run Qwen3-ForcedAligner on ``todo`` entries.
+
+    Each entry must be ``{\"audio_path\": str, \"text\": str}``.
+    Writes ``cache_path(audio_path)`` for each successful alignment.
+    """
+    if not todo:
+        return
+    n = len(gpus)
+    if n == 0:
+        logger.error("run_forced_alignment_jobs: empty GPU list.")
+        return
+    if n == 1:
+        _worker(gpus[0], todo, language, batch_size)
+        return
+
+    chunks = [todo[i::n] for i in range(n)]
+    logger.info(
+        "Splitting %d files across %d GPUs: %s",
+        len(todo),
+        n,
+        [len(c) for c in chunks],
+    )
+
+    # Spawn workers re-import this module; ensure repo root is importable when the
+    # parent script was launched from another directory (e.g. SpeechLMCorrector/).
+    repo_root = str(Path(__file__).resolve().parent)
+    _prev_pp = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = (
+        repo_root
+        if _prev_pp is None
+        else f"{repo_root}{os.pathsep}{_prev_pp}"
+    )
+
+    try:
+        mp.set_start_method("spawn", force=True)
+        procs = []
+        for gpu_id, chunk in zip(gpus, chunks):
+            if not chunk:
+                continue
+            p = mp.Process(
+                target=_worker,
+                args=(gpu_id, chunk, language, batch_size),
+                name=f"aligner-gpu{gpu_id}",
+            )
+            p.start()
+            procs.append(p)
+
+        for p in procs:
+            p.join()
+            if p.exitcode != 0:
+                logger.error("Worker %s exited with code %d", p.name, p.exitcode)
+    finally:
+        if _prev_pp is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = _prev_pp
+
+
 # ── Entry-list builders ───────────────────────────────────────────────────────
 
 def _load_from_reference(ref_path: str, audio_dir: str = "",
@@ -297,35 +361,8 @@ def main() -> None:
         logger.info("Nothing to do.")
         return
 
-    # ── Distribute work across GPUs ───────────────────────────────────────────
     gpus = [int(g.strip()) for g in args.gpus.split(",") if g.strip()]
-    n = len(gpus)
-
-    if n == 1:
-        _worker(gpus[0], todo, args.language, args.batch_size)
-    else:
-        # Round-robin split so each GPU gets balanced load
-        chunks = [todo[i::n] for i in range(n)]
-        logger.info("Splitting %d files across %d GPUs: %s",
-                    len(todo), n, [len(c) for c in chunks])
-
-        mp.set_start_method("spawn", force=True)
-        procs = []
-        for gpu_id, chunk in zip(gpus, chunks):
-            if not chunk:
-                continue
-            p = mp.Process(
-                target=_worker,
-                args=(gpu_id, chunk, args.language, args.batch_size),
-                name=f"aligner-gpu{gpu_id}",
-            )
-            p.start()
-            procs.append(p)
-
-        for p in procs:
-            p.join()
-            if p.exitcode != 0:
-                logger.error("Worker %s exited with code %d", p.name, p.exitcode)
+    run_forced_alignment_jobs(todo, gpus, args.language, args.batch_size)
 
     logger.info("All done.")
 

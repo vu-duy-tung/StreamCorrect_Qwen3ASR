@@ -4,6 +4,35 @@ Streaming ASR using Qwen3-ASR-1.7B with block-wise async beam search, with optio
 
 ---
 
+## Pretrained SpeechLM corrector checkpoints
+
+Pretrained adapter checkpoints live in the Hugging Face dataset repo [`playwithmino/StreamCorrect_internal`](https://huggingface.co/datasets/playwithmino/StreamCorrect_internal), as **`ver1.zip`** (unpacks to **`ver1_ckpt/`**) and **`ver2.zip`** (**`ver2_ckpt/`**). On internal waihu test set **ver1** reaches **10.99%** CER and **ver2** reaches **12.88%** CER; however, **ver2** fine-tuned on **more training data** than **ver1**.
+
+Download and extract from the terminal (no manual browser download):
+
+```bash
+pip install -U "huggingface_hub[cli]"   # if `hf` is not available
+
+mkdir -p streamcorrect_ckpts && cd streamcorrect_ckpts
+hf download playwithmino/StreamCorrect_internal ver1.zip ver2.zip \
+  --repo-type dataset --local-dir .
+unzip -q ver1.zip && unzip -q ver2.zip
+cd ..
+```
+
+Use the extracted directory as `ERROR_CORRECTOR_CKPT`. Replace `/path/to/checkpoint` in the examples below with e.g. **`$(pwd)/streamcorrect_ckpts/ver1_ckpt`** or **`$(pwd)/streamcorrect_ckpts/ver2_ckpt`** (absolute paths are fine too).
+
+```bash
+AUDIO_DIR=/path/to/wav_dir \
+OUTPUT_DIR=./batch_output \
+WORKERS=4 \
+GPUS=0,1,2,3 \
+ERROR_CORRECTOR_CKPT="./streamcorrect_ckpts/ver1_ckpt" \
+bash run_single_eval_qwen3asr_vllm.sh
+```
+
+---
+
 ## Quick start
 
 All scripts are in `runs/`. Run them from the `runs/` directory.
