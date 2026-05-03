@@ -38,8 +38,8 @@ train_audio_encoder: false
 # -----------------------------------------------------------------------------
 # Training Parameters
 # -----------------------------------------------------------------------------
-output_dir: "/data/mino/model_ckpts/waihu_6"
-num_train_epochs: 8
+output_dir: "/data/mino/model_ckpts/waihu_8"
+num_train_epochs: 4
 # NOTE: For 8B model, reduce batch size to fit in GPU memory
 # 1B model: batch_size=8 works on 24GB GPU
 # 8B model: batch_size=1-2 recommended on 24GB GPU, increase gradient_accumulation_steps
@@ -123,16 +123,10 @@ wandb_tags:
 train_data_paths:
   - path: "../SpeechLMCorrector/data/synthesized_data_v3/waihu_qwen3asr_train_dedup.jsonl"
     weight: 3  # ~16k samples × 2 — upweighted to balance with larger KeSpeech/AISHELL sets
-  - path: "../SpeechLMCorrector/data/synthesized_data_v3/waihu_qwen3asr_train_1s_chunk_size_dedup.jsonl"
-    weight: 3
-  - path: "../SpeechLMCorrector/data/synthesized_data_v3/kespeech_qwen3asr_train_10000_dedup.jsonl"
+  - path: "../SpeechLMCorrector/data/synthesized_data_v3/kespeech_qwen3asr_train_20000_dedup_rmobv.jsonl"
     weight: 1  # ~31k samples
-  - path: "../SpeechLMCorrector/data/synthesized_data_v3/kespeech_qwen3asr_train_1s_10000_dedup.jsonl"
-    weight: 1
-  - path: "../SpeechLMCorrector/data/synthesized_data_v3/aishell_qwen3asr_train_10000_dedup.jsonl"
+  - path: "../SpeechLMCorrector/data/synthesized_data_v3/aishell_qwen3asr_train_20000_dedup_rmobv.jsonl"
     weight: 1  # ~30k samples
-  - path: "../SpeechLMCorrector/data/synthesized_data_v3/aishell_qwen3asr_train_1s_10000_dedup.jsonl"
-    weight: 1
 eval_data_path: null   # Set to your evaluation data path (optional)
 
 # Train/validation split settings

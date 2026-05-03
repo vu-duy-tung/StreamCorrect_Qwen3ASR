@@ -1,8 +1,6 @@
 # StreamCorrect — Qwen3-ASR
 
-Streaming ASR using Qwen3-ASR-1.7B with block-wise async beam search, with optional SpeechLM error corrector.
-
-- [ ] Optimize the fine-tuning of Qwen3-ASR-0.6B on error correction data, document for current implementation can be read [here](DOCUMENTS/QWEN-CORRECTOR.md)
+Streaming ASR using Qwen3-ASR-1.7B with block-wise async beam search, with optional SpeechLM or Qwen3-ASR error correctors. Full detail on the **Qwen3-ASR-0.6B corrector** stack is in [DOCUMENTS/QWEN-CORRECTOR.md](DOCUMENTS/QWEN-CORRECTOR.md).
 
 ---
 
@@ -115,7 +113,7 @@ bash run_batch_eval_qwen3asr_vllm.sh
 | `WORKERS` | `5` | Parallel workers (batch only) |
 | `GPUS` | `0,1,2,3,4` | GPU IDs for workers (batch only) |
 | `ERROR_CORRECTOR_CKPT` | *(unset)* | Corrector checkpoint path — enables corrector when set |
-| `ERROR_CORRECTOR_TYPE` | `speechlm` | `speechlm` (audio+text) or `lm` (text-only) |
+| `ERROR_CORRECTOR_TYPE` | `speechlm` | `speechlm`, `qwen3asr` (Qwen3-ASR-0.6B LoRA), or `lm` (text-only) |
 | `REFERENCE_FILE` | (see script) | Transcript JSON for CER evaluation |
 | `OUTPUT_DIR` | `./output/…` | Directory for results |
 
@@ -123,4 +121,40 @@ bash run_batch_eval_qwen3asr_vllm.sh
 
 ## Training the error corrector
 
-See `SpeechLMCorrector/train_qwen2audio.sh` (Qwen2-Audio backend) or `LMCorrector/train.sh` (text-only).
+### Training JSONL data (download and unzip)
+
+The dataset repo [`playwithmino/StreamCorrect_internal`](https://huggingface.co/datasets/playwithmino/StreamCorrect_internal) includes **`synthesized_data_v3_jsonl.zip`**, which unpacks to a **`data/`** folder with three JSONL files (`waihu_…`, `aishell_…`, `kespeech_…`). Place them next to your other synthesized corpora so paths in the training configs resolve:
+
+```bash
+# From the repository root
+mkdir -p SpeechLMCorrector/data/synthesized_data_v3
+cd SpeechLMCorrector/data/synthesized_data_v3
+hf download playwithmino/StreamCorrect_internal synthesized_data_v3_jsonl.zip \
+  --repo-type dataset --local-dir .
+unzip -o synthesized_data_v3_jsonl.zip
+mv data/*.jsonl .
+rmdir data 2>/dev/null || true
+```
+
+If **`Qwen3ASRCorrector/training_config.yaml`** (or SpeechLM YAML) lists JSONL paths you do not have locally, edit **`train_data_paths`** to match the files you downloaded, or add the missing files.
+
+### Fine-tune Qwen3-ASR-0.6B as corrector (`Qwen3ASRCorrector/train.sh`)
+
+[`Qwen3ASRCorrector/training_config.yaml`](Qwen3ASRCorrector/training_config.yaml) defines the base model (`Qwen/Qwen3-ASR-0.6B`), LoRA targets, data sources, and Trainer hyperparameters. Run from the **repository root**:
+
+```bash
+bash Qwen3ASRCorrector/train.sh
+```
+
+Multi-GPU (recommended over naive multi-device `python`):
+
+```bash
+NPROC=4 CUDA_VISIBLE_DEVICES=0,1,2,3 bash Qwen3ASRCorrector/train.sh
+```
+
+Optional flags: `--config …`, `--adapter /path/to/lora`, `--resume /path/to/checkpoint-XXXX`, `--output /path/to/out`, `--port PORT`. Checkpoints and the final adapter land under **`output_dir/final/`** (see YAML); point **`ERROR_CORRECTOR_CKPT`** there at inference and set **`ERROR_CORRECTOR_TYPE=qwen3asr`** (e.g. `runs/run_batch_eval_double_qwen3asr.sh`).
+
+### Other corrector backends
+
+- **SpeechLM / Qwen2-Audio:** `SpeechLMCorrector/train_qwen2audio.sh`
+- **Text-only LM:** `LMCorrector/train.sh`
