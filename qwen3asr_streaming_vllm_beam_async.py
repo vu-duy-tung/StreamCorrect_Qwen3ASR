@@ -204,7 +204,7 @@ class Qwen3ASRBackendASR(ASRBase):
         return {
             'chunk_id': 0,
             'unfixed_chunk_num': 0,
-            'unfixed_token_num': 2,
+            'unfixed_token_num': 0,
             'audio_accum': np.zeros(0, dtype=np.float32),
             '_raw_decoded': ''
         }

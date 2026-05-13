@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fine-tune Qwen3-ASR as an ASR error corrector (LoRA on the text decoder).
+"""Fine-tune Qwen3-ASR as an ASR error corrector.
 
 Architecture notes
 ------------------
@@ -11,13 +11,17 @@ and is suitable for training.
 Training graph
   outer model (Qwen3ASRForConditionalGeneration)
       └── thinker  ← the model we actually train
-              ├── audio_tower  (Whisper-style encoder — frozen)
-              └── model        (Qwen3 text decoder — LoRA applied here)
+              ├── audio_tower  (Whisper-style encoder — frozen by default)
+              └── model        (Qwen3 text decoder — LoRA or full weights)
 
-LoRA is applied to the thinker; the audio_tower is frozen throughout.
+Modes (see ``use_lora`` / ``--full_finetune`` in config):
+  * LoRA on the decoder (default ``training_config.yaml``)
+  * Full-parameter decoder fine-tuning (audio encoder still frozen unless
+    ``freeze_encoder: false``)
 
 Usage:
     python training_qwen3asr.py --config training_config.yaml
+    python training_qwen3asr.py --config training_config_full_ft.yaml --full_finetune
 """
 
 import argparse
@@ -148,6 +152,29 @@ def apply_lora(model, cfg: dict):
     return model
 
 
+def log_trainable_parameter_summary(model, label: str = "model") -> None:
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    pct = 100.0 * trainable / total if total else 0.0
+    logger.info(
+        "%s trainable params: %s / %s (%.4f%%)",
+        label,
+        f"{trainable:,}",
+        f"{total:,}",
+        pct,
+    )
+
+
+def prepare_full_finetune(model, train_encoder: bool) -> None:
+    """Enable gradients for full-parameter fine-tuning (decoder always; encoder optional)."""
+    for name, param in model.named_parameters():
+        if train_encoder:
+            param.requires_grad = True
+        else:
+            param.requires_grad = not _is_encoder_param(name)
+    log_trainable_parameter_summary(model, "thinker (full FT)")
+
+
 def load_existing_adapter(model, adapter_path: str):
     """Load an existing LoRA adapter and keep it trainable for continued tuning."""
     logger.info("Loading adapter from %s", adapter_path)
@@ -224,6 +251,11 @@ def main() -> None:
         action="store_true",
         help="Load model, print layer names, then exit.",
     )
+    parser.add_argument(
+        "--full_finetune",
+        action="store_true",
+        help="Fine-tune all non-encoder thinker weights (no LoRA). Same as use_lora: false in config.",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -281,14 +313,24 @@ def main() -> None:
     )
     logger.info("Audio tensor key: '%s'", collator.audio_key)
 
-    # ── Freeze encoder + apply LoRA ───────────────────────────────────────────
+    use_lora = cfg.get("use_lora", True)
+    if args.full_finetune:
+        use_lora = False
+
+    # ── Freeze encoder + LoRA or full-parameter decoder ───────────────────────
     if cfg.get("freeze_encoder", True):
         freeze_encoder(model)
+    else:
+        logger.info("freeze_encoder=false — audio encoder weights are trainable.")
 
     if args.load_adapter:
+        if not use_lora:
+            parser.error("--load_adapter is only valid with LoRA (use_lora: true).")
         model = load_existing_adapter(model, args.load_adapter)
-    else:
+    elif use_lora:
         model = apply_lora(model, cfg)
+    else:
+        prepare_full_finetune(model, train_encoder=not cfg.get("freeze_encoder", True))
 
     # ── TrainingArguments ─────────────────────────────────────────────────────
     output_dir: str = cfg.get("output_dir", "./checkpoints")
@@ -302,6 +344,7 @@ def main() -> None:
         warmup_ratio=cfg.get("warmup_ratio", 0.05),
         lr_scheduler_type=cfg.get("lr_scheduler_type", "cosine"),
         max_grad_norm=cfg.get("max_grad_norm", 1.0),
+        gradient_checkpointing=cfg.get("gradient_checkpointing", False),
         bf16=torch.cuda.is_bf16_supported(),
         fp16=not torch.cuda.is_bf16_supported(),
         dataloader_num_workers=cfg.get("dataloader_num_workers", 4),
@@ -349,10 +392,10 @@ def main() -> None:
     logger.info("Starting training …")
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
-    # Save LoRA adapter + processor only on global rank 0.
+    # Save weights + processor only on global rank 0.
     if trainer.is_world_process_zero():
         # Avoid peft warning when adapter config misses base model path.
-        if hasattr(model, "peft_config"):
+        if use_lora and hasattr(model, "peft_config"):
             for peft_cfg in model.peft_config.values():
                 if not getattr(peft_cfg, "base_model_name_or_path", None):
                     peft_cfg.base_model_name_or_path = cfg["model_name"]
@@ -360,12 +403,23 @@ def main() -> None:
         final_dir = os.path.join(output_dir, "final")
         model.save_pretrained(final_dir)
         processor.save_pretrained(final_dir)
-        logger.info("Saved LoRA adapter to %s", final_dir)
-        logger.info(
-            "To load at inference: outer=AutoModel.from_pretrained('%s', ...); "
-            "from peft import PeftModel; outer.thinker = PeftModel.from_pretrained(outer.thinker, '%s')",
-            cfg["model_name"], final_dir,
-        )
+        if use_lora:
+            logger.info("Saved LoRA adapter to %s", final_dir)
+            logger.info(
+                "To load at inference: outer=AutoModel.from_pretrained('%s', ...); "
+                "from peft import PeftModel; outer.thinker = PeftModel.from_pretrained(outer.thinker, '%s')",
+                cfg["model_name"],
+                final_dir,
+            )
+        else:
+            logger.info("Saved full thinker checkpoint to %s", final_dir)
+            logger.info(
+                "Inference: load base with AutoModel.from_pretrained('%s', ...), then load "
+                "this directory into outer.thinker (e.g. outer.thinker.from_pretrained('%s') "
+                "or state_dict load) — your runtime must use dense weights, not PeftModel.",
+                cfg["model_name"],
+                final_dir,
+            )
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
