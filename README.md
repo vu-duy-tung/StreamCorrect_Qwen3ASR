@@ -1,35 +1,55 @@
 # StreamCorrect — Qwen3-ASR
 
-Streaming ASR using Qwen3-ASR-1.7B with block-wise async beam search, with optional SpeechLM or Qwen3-ASR error correctors. Full detail on the **Qwen3-ASR-0.6B corrector** stack is in [DOCUMENTS/QWEN-CORRECTOR.md](DOCUMENTS/QWEN-CORRECTOR.md).
+Streaming ASR using Qwen3-ASR-1.7B with block-wise async beam search, optional **SpeechLM** (Ultravox) as error correctors, and optional **locally fine-tuned Qwen3-ASR** weights for the streaming recognizer. For training the **Qwen3-ASR-0.6B** corrector, see [DOCUMENTS/QWEN-CORRECTOR.md](DOCUMENTS/QWEN-CORRECTOR.md).
 
 ---
 
-## Pretrained SpeechLM corrector checkpoints
+## Pretrained checkpoints (Hugging Face)
 
-Pretrained adapter checkpoints live in the Hugging Face dataset repo [`playwithmino/StreamCorrect_internal`](https://huggingface.co/datasets/playwithmino/StreamCorrect_internal), as **`ver1.zip`** (unpacks to **`ver1_ckpt/`**) and **`ver2.zip`** (**`ver2_ckpt/`**). On internal waihu test set **ver1** reaches **10.99%** CER and **ver2** reaches **12.88%** CER; however, **ver2** fine-tuned on **more training data** than **ver1**.
+Artifacts live in [`playwithmino/StreamCorrect_internal`](https://huggingface.co/datasets/playwithmino/StreamCorrect_internal).
 
-Download and extract from the terminal (no manual browser download):
+### SpeechLM error corrector (LoRA on Ultravox)
+
+- **`ver1.zip`** → **`ver1_ckpt/`**, **`ver2.zip`** → **`ver2_ckpt/`** — historical SpeechLM adapters. On our internal waihu test set **ver1** reaches **10.99%** CER and **ver2** **12.88%** CER; **ver2** used **more training data** than **ver1**.
+- **`ver3.zip`** → **`ver3_ckpt/`** — current best SpeechLM corrector (same stack: base **`fixie-ai/ultravox-v0_5-llama-3_2-1b`** + LoRA). Use with **`ERROR_CORRECTOR_TYPE=speechlm`**.
+
+### Finetuned Qwen3-ASR (streaming recognizer)
+
+- **`finetuned_qwen3asr.zip`** (~12 GB, store-compressed) → **`finetuned_qwen3asr/`** — full Trainer checkpoint for the **streaming ASR** (weights + tokenizer files + optimizer state). Point **`RECOGNIZER_CKPT`** at this directory in **`runs/run_batch_eval_qwen3asr_vllm.sh`**. The bundle may omit **`preprocessor_config.json`**; the script merges missing processor files from **`RECOGNIZER_BASE_PROCESSOR`** (default **`MODEL`**, e.g. **`Qwen/Qwen3-ASR-1.7B`**).
+
+### Download and unzip
 
 ```bash
 pip install -U "huggingface_hub[cli]"   # if `hf` is not available
 
 mkdir -p streamcorrect_ckpts && cd streamcorrect_ckpts
-hf download playwithmino/StreamCorrect_internal ver1.zip ver2.zip \
+hf download playwithmino/StreamCorrect_internal \
+  ver1.zip ver2.zip ver3.zip finetuned_qwen3asr.zip \
   --repo-type dataset --local-dir .
-unzip -q ver1.zip && unzip -q ver2.zip
+unzip -q ver1.zip && unzip -q ver2.zip && unzip -q ver3.zip
+unzip -q finetuned_qwen3asr.zip   # large; creates finetuned_qwen3asr/
 cd ..
 ```
 
-Use the extracted directory as `ERROR_CORRECTOR_CKPT`.
+Download only the archives you need (omit **`finetuned_qwen3asr.zip`** if you keep using the Hub **`MODEL`** id only).
+
+### Using `ver3_ckpt` + finetuned streaming ASR
+
+From the **`runs/`** directory, pass **absolute or repo-root-relative** paths. **`ERROR_CORRECTOR_BASE_MODEL`** must match the LoRA base in **`ver3_ckpt/adapter_config.json`** (Ultravox).
 
 ```bash
-AUDIO_DIR=/path/to/wav_dir \
-OUTPUT_DIR=./batch_output \
-WORKERS=4 \
-GPUS=0,1,2,3 \
-ERROR_CORRECTOR_CKPT="./streamcorrect_ckpts/ver1_ckpt" \
-bash run_single_eval_qwen3asr_vllm.sh
+cd runs
+REPO="$(cd .. && pwd)"
+MODEL=Qwen/Qwen3-ASR-1.7B \
+RECOGNIZER_CKPT="$REPO/streamcorrect_ckpts/finetuned_qwen3asr" \
+RECOGNIZER_BASE_PROCESSOR=Qwen/Qwen3-ASR-1.7B \
+ERROR_CORRECTOR_CKPT="$REPO/streamcorrect_ckpts/ver3_ckpt" \
+ERROR_CORRECTOR_TYPE=speechlm \
+ERROR_CORRECTOR_BASE_MODEL=fixie-ai/ultravox-v0_5-llama-3_2-1b \
+bash run_batch_eval_qwen3asr_vllm.sh
 ```
+
+Use **`ver1_ckpt`** / **`ver2_ckpt`** the same way: set **`ERROR_CORRECTOR_CKPT`** only (same **`ERROR_CORRECTOR_TYPE`** / base model).
 
 ---
 
@@ -105,7 +125,9 @@ bash run_batch_eval_qwen3asr_vllm.sh
 | Variable | Default | Description |
 |---|---|---|
 | `AUDIO_PATH` / `AUDIO_DIR` | (see script) | Input audio file or directory |
-| `MODEL` | `Qwen/Qwen3-ASR-1.7B` | Model path or HF repo id |
+| `MODEL` | `Qwen/Qwen3-ASR-1.7B` | Base Qwen3-ASR id or path when using `RECOGNIZER_CKPT` bootstrap |
+| `RECOGNIZER_CKPT` | *(see `run_batch_eval_qwen3asr_vllm.sh`)* | Local fine-tuned ASR checkpoint dir; unset uses Hub **`MODEL`** only |
+| `RECOGNIZER_BASE_PROCESSOR` | `$MODEL` | Source for missing processor/tokenizer files next to `RECOGNIZER_CKPT` |
 | `LANGUAGE` | `zh` | Language code (`zh`, `yue`, `en`, …) |
 | `BEAMS` | `4` | Beam width |
 | `CHUNK_SIZE` | `0.5` | VAD chunk size in seconds |
@@ -113,6 +135,7 @@ bash run_batch_eval_qwen3asr_vllm.sh
 | `WORKERS` | `5` | Parallel workers (batch only) |
 | `GPUS` | `0,1,2,3,4` | GPU IDs for workers (batch only) |
 | `ERROR_CORRECTOR_CKPT` | *(unset)* | Corrector checkpoint path — enables corrector when set |
+| `ERROR_CORRECTOR_BASE_MODEL` | *(see script)* | Base weights for LoRA correctors (Ultravox for `speechlm`, Qwen3-ASR-0.6B for `qwen3asr`) |
 | `ERROR_CORRECTOR_TYPE` | `speechlm` | `speechlm`, `qwen3asr` (Qwen3-ASR-0.6B LoRA), or `lm` (text-only) |
 | `REFERENCE_FILE` | (see script) | Transcript JSON for CER evaluation |
 | `OUTPUT_DIR` | `./output/…` | Directory for results |
