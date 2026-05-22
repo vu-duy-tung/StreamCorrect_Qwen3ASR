@@ -16,6 +16,8 @@ import time
 import logging
 import argparse
 import unicodedata
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -23,6 +25,41 @@ import torch
 from streaming.base import OnlineProcessorInterface, ASRBase
 
 logger = logging.getLogger(__name__)
+
+SAMPLE_RATE = 16000
+SILENCE_RMS_THRESHOLD = 1e-4
+
+
+@dataclass
+class StreamLatency:
+    ftl_ms: Optional[float] = None
+    ltl_ms: Optional[float] = None
+
+
+@dataclass
+class _StreamTiming:
+    ftl_start_ts: Optional[float] = None
+    ftl_end_ts: Optional[float] = None
+    last_audio_fed_ts: Optional[float] = None
+    last_generate_end_ts: Optional[float] = None
+
+    def finalize(self) -> StreamLatency:
+        ftl_ms = None
+        if self.ftl_start_ts is not None and self.ftl_end_ts is not None:
+            ftl_ms = (self.ftl_end_ts - self.ftl_start_ts) * 1000.0
+
+        ltl_ms = None
+        if self.last_audio_fed_ts is not None and self.last_generate_end_ts is not None:
+            ltl_ms = (self.last_generate_end_ts - self.last_audio_fed_ts) * 1000.0
+
+        return StreamLatency(ftl_ms=ftl_ms, ltl_ms=ltl_ms)
+
+
+def _is_non_silent(pcm: np.ndarray, threshold: float = SILENCE_RMS_THRESHOLD) -> bool:
+    if pcm is None or pcm.size == 0:
+        return False
+    rms = float(np.sqrt(np.mean(np.square(np.asarray(pcm, dtype=np.float64)))))
+    return rms >= threshold
 
 LANG_CODE_TO_NAME = {
     'yue': 'Cantonese', 'zh': 'Chinese', 'en': 'English',
@@ -197,6 +234,52 @@ class Qwen3ASRBackendASR(ASRBase):
             disable_log_stats=True
         )
         logger.info(f'Language: {language} -> {self.force_language}')
+        self._timing: Optional[_StreamTiming] = None
+        self._original_generate = None
+
+    def start_latency_tracking(self) -> None:
+        self._timing = _StreamTiming()
+        if self._original_generate is None:
+            self._original_generate = self.qwen3.model.generate
+
+        timing = self._timing
+
+        def generate_with_timing(*args, **kwargs):
+            outputs = self._original_generate(*args, **kwargs)
+            if timing is not None:
+                timing.last_generate_end_ts = time.perf_counter()
+            return outputs
+
+        self.qwen3.model.generate = generate_with_timing
+
+    def stop_latency_tracking(self) -> StreamLatency:
+        if self._original_generate is not None:
+            self.qwen3.model.generate = self._original_generate
+        timing = self._timing
+        self._timing = None
+        if timing is None:
+            return StreamLatency()
+        return timing.finalize()
+
+    def note_audio_fed(self, pcm: np.ndarray) -> None:
+        if self._timing is None:
+            return
+        fed_ts = time.perf_counter()
+        self._timing.last_audio_fed_ts = fed_ts
+        if _is_non_silent(pcm) and self._timing.ftl_start_ts is None:
+            self._timing.ftl_start_ts = fed_ts
+
+    def _note_transcript(self, candidates) -> None:
+        if self._timing is None or not candidates:
+            return
+        text = (candidates[0] or "").strip()
+        if (
+            self._timing.ftl_start_ts is not None
+            and self._timing.ftl_end_ts is None
+            and text
+            and self._timing.last_generate_end_ts is not None
+        ):
+            self._timing.ftl_end_ts = self._timing.last_generate_end_ts
 
     def init_state(self):
         """Initializes a custom streaming state for pseudo-streaming via HuggingFace."""
@@ -240,6 +323,7 @@ class Qwen3ASRBackendASR(ASRBase):
                     next_raw = _strip_intermediate_tail_artifacts(next_raw)
                 state['_raw_decoded'] = next_raw
                 state['chunk_id'] += 1
+                self._note_transcript(candidates)
         except Exception as e:
             import traceback
             logger.warning(f'Beam search failed ({e})\n{traceback.format_exc()}\nfalling back to greedy')
@@ -251,6 +335,7 @@ class Qwen3ASRBackendASR(ASRBase):
             candidates = [_normalize_text(text)]
             state['_raw_decoded'] = text
             state['chunk_id'] += 1
+            self._note_transcript(candidates)
 
         return candidates, state, beam_prefix
 
@@ -479,11 +564,26 @@ class Qwen3ASRBackendASR(ASRBase):
         return candidates, best_raw_decoded, prefix
 
     def warmup(self, audio, init_prompt=''):
-        logger.info('Warming up Qwen3-ASR...')
+        logger.info('Warming up Qwen3-ASR (offline)...')
         results = self.qwen3.transcribe(
             audio=(audio, 16000), language=self.force_language,
         )
         logger.info(f'Warmup result: {results[0].text}')
+
+    def warmup_streaming(self, audio, chunk_size_sec: float = 0.5) -> None:
+        """Untimed streaming warmup via infer_chunk to match measured inference path."""
+        logger.info('Warming up Qwen3-ASR streaming (beam)...')
+        audio_np = np.asarray(audio, dtype=np.float32).reshape(-1)
+        step = max(1, int(round(chunk_size_sec * SAMPLE_RATE)))
+        state = self.init_state()
+        pos = 0
+        while pos < audio_np.shape[0]:
+            chunk = audio_np[pos : pos + step]
+            pos += chunk.shape[0]
+            self.infer_chunk(chunk, state, is_last=False)
+        if state['audio_accum'].shape[0] > 0:
+            self.infer_chunk(np.zeros((0,), dtype=np.float32), state, is_last=True)
+        logger.info('Streaming warmup complete.')
 
     def transcribe(self, audio, init_prompt=''):
         raise NotImplementedError('Use Qwen3ASROnline.process_iter()')
@@ -693,10 +793,6 @@ class Qwen3ASROnline(OnlineProcessorInterface):
                 delta = full_text[match.b + match.size:]
             else:
                 delta = full_text
-
-        if not self._first_token_generated and start_time is not None and delta:
-            self.first_token_latency = time.time() - start_time
-            self._first_token_generated = True
 
         saved_offset = self.offset
         saved_end = self.end
