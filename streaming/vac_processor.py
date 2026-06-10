@@ -1,6 +1,5 @@
 import os
 from transformers import AutoProcessor, AutoModel, AutoTokenizer, AutoConfig
-from peft import PeftModel
 from streaming.base import OnlineProcessorInterface
 from streaming.vad_iterator import FixedVADIterator
 
@@ -8,6 +7,7 @@ import torch
 import numpy as np
 import logging
 import sys
+from safetensors.torch import load_file as safe_load_file
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,10 @@ class VACProcessor(OnlineProcessorInterface):
         error_corrector_ckpt=None,
         error_corrector_base_model=None,
         error_corrector_type="speechlm",  # "speechlm", "lm", or "qwen3asr"
+        error_corrector_audio_window="runtime",
+        error_corrector_output_mode="suffix",
+        error_corrector_scope="all",
+        error_corrector_acceptance_mode="off",
     ):
         self.online_chunk_size = online_chunk_size
         self.online = online
@@ -48,6 +52,11 @@ class VACProcessor(OnlineProcessorInterface):
         self._corrector_model = None
         self._corrector_processor = None
         self._corrector_type = error_corrector_type  # "speechlm" or "lm"
+        if hasattr(self.online, "asr"):
+            self.online.asr.error_corrector_audio_window = error_corrector_audio_window
+            self.online.asr.error_corrector_output_mode = error_corrector_output_mode
+            self.online.asr.error_corrector_scope = error_corrector_scope
+            self.online.asr.error_corrector_acceptance_mode = error_corrector_acceptance_mode
 
         if use_error_corrector:
             if error_corrector_type == "lm":
@@ -82,6 +91,8 @@ class VACProcessor(OnlineProcessorInterface):
                 )
                 
                 # Load LoRA adapter
+                from peft import PeftModel
+
                 self._corrector_model = PeftModel.from_pretrained(
                     base_model,
                     checkpoint_path,
@@ -117,12 +128,37 @@ class VACProcessor(OnlineProcessorInterface):
                     low_cpu_mem_usage=True,
                     trust_remote_code=False,
                 )
-                thinker = base_outer.thinker.to("cuda")
-                self._corrector_model = PeftModel.from_pretrained(
-                    thinker,
-                    checkpoint_path,
-                    is_trainable=False,
-                ).to("cuda")
+
+                if os.path.isfile(os.path.join(checkpoint_path, "adapter_config.json")):
+                    from peft import PeftModel
+
+                    thinker = base_outer.thinker.to("cuda")
+                    self._corrector_model = PeftModel.from_pretrained(
+                        thinker,
+                        checkpoint_path,
+                        is_trainable=False,
+                    ).to("cuda")
+                    logger.info("Loaded Qwen3-ASR LoRA corrector adapter")
+                else:
+                    state_path = os.path.join(checkpoint_path, "model.safetensors")
+                    if not os.path.isfile(state_path):
+                        raise FileNotFoundError(
+                            f"Qwen3-ASR corrector checkpoint must contain adapter_config.json "
+                            f"or model.safetensors: {checkpoint_path}"
+                        )
+                    state = safe_load_file(state_path, device="cpu")
+                    if state and all(k.startswith("thinker.") for k in state.keys()):
+                        missing, unexpected = base_outer.load_state_dict(state, strict=False)
+                        self._corrector_model = base_outer.thinker.to("cuda")
+                    else:
+                        missing, unexpected = base_outer.thinker.load_state_dict(state, strict=False)
+                        self._corrector_model = base_outer.thinker.to("cuda")
+                    logger.info(
+                        "Loaded Qwen3-ASR dense corrector checkpoint "
+                        "(missing=%d unexpected=%d)",
+                        len(missing),
+                        len(unexpected),
+                    )
                 self._corrector_model.eval()
                 logger.info("Qwen3-ASR corrector loaded successfully")
             else:
@@ -163,12 +199,24 @@ class VACProcessor(OnlineProcessorInterface):
                         device_map="cuda",
                     )
 
-                # Load LoRA adapter
-                self._corrector_model = PeftModel.from_pretrained(
-                    base_model,
-                    checkpoint_path,
-                    is_trainable=False,
-                )
+                adapter_config = os.path.join(checkpoint_path, "adapter_config.json")
+                if os.path.isfile(adapter_config):
+                    # Load LoRA adapter for the trained SpeechLM corrector.
+                    from peft import PeftModel
+
+                    self._corrector_model = PeftModel.from_pretrained(
+                        base_model,
+                        checkpoint_path,
+                        is_trainable=False,
+                    )
+                else:
+                    # Baseline: use the raw Ultravox/Qwen2-Audio base model as
+                    # an audio-conditioned corrector, without any EC adapter.
+                    logger.info(
+                        "No adapter_config.json found in %s; using base SpeechLM model without LoRA adapter",
+                        checkpoint_path,
+                    )
+                    self._corrector_model = base_model
                 self._corrector_model.eval()
                 logger.info("SpeechLM corrector loaded successfully")
         else:

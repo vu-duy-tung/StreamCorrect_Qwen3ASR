@@ -16,8 +16,6 @@ import time
 import logging
 import argparse
 import unicodedata
-from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -25,41 +23,6 @@ import torch
 from streaming.base import OnlineProcessorInterface, ASRBase
 
 logger = logging.getLogger(__name__)
-
-SAMPLE_RATE = 16000
-SILENCE_RMS_THRESHOLD = 1e-4
-
-
-@dataclass
-class StreamLatency:
-    ftl_ms: Optional[float] = None
-    ltl_ms: Optional[float] = None
-
-
-@dataclass
-class _StreamTiming:
-    ftl_start_ts: Optional[float] = None
-    ftl_end_ts: Optional[float] = None
-    last_audio_fed_ts: Optional[float] = None
-    last_generate_end_ts: Optional[float] = None
-
-    def finalize(self) -> StreamLatency:
-        ftl_ms = None
-        if self.ftl_start_ts is not None and self.ftl_end_ts is not None:
-            ftl_ms = (self.ftl_end_ts - self.ftl_start_ts) * 1000.0
-
-        ltl_ms = None
-        if self.last_audio_fed_ts is not None and self.last_generate_end_ts is not None:
-            ltl_ms = (self.last_generate_end_ts - self.last_audio_fed_ts) * 1000.0
-
-        return StreamLatency(ftl_ms=ftl_ms, ltl_ms=ltl_ms)
-
-
-def _is_non_silent(pcm: np.ndarray, threshold: float = SILENCE_RMS_THRESHOLD) -> bool:
-    if pcm is None or pcm.size == 0:
-        return False
-    rms = float(np.sqrt(np.mean(np.square(np.asarray(pcm, dtype=np.float64)))))
-    return rms >= threshold
 
 LANG_CODE_TO_NAME = {
     'yue': 'Cantonese', 'zh': 'Chinese', 'en': 'English',
@@ -79,11 +42,32 @@ LANG_CODE_TO_NAME = {
 # ---------------------------------------------------------------------------
 
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
-_QWEN3ASR_CORRECTOR_SYSTEM_PROMPT = (
+_SEMANTIC_PUNCTUATION = {"%", "％"}
+_QWEN3ASR_CORRECTOR_SUFFIX_SYSTEM_PROMPT = (
     "You are an ASR error corrector. "
-    "Listen to the audio and, given the k-best hypotheses below, "
-    "output the single best corrected transcript for this audio segment."
+    "Listen to the audio and, given the previous confirmed transcript plus "
+    "the k-best full hypotheses below, output only the corrected suffix that "
+    "should be appended after the previous transcript. Do not repeat the "
+    "previous transcript."
 )
+_QWEN3ASR_CORRECTOR_SUFFIX_BEAM_SWITCH_SYSTEM_PROMPT = (
+    "You are an ASR error corrector. "
+    "Listen to the audio and compare the k-best full hypotheses below. "
+    "Use candidate 1 only when the audio supports it; otherwise use the "
+    "candidate whose suffix best matches the audio, with minimal correction. "
+    "Output only the corrected suffix that should be appended after the "
+    "previous confirmed transcript. Do not repeat the previous transcript."
+)
+_QWEN3ASR_CORRECTOR_FULL_TRANSCRIPT_SYSTEM_PROMPT = (
+    "You are an ASR error corrector. "
+    "Listen to the audio and, given the k-best full hypotheses below, output "
+    "only the corrected full transcript. Do not add explanations."
+)
+_QWEN3ASR_CORRECTOR_SYSTEM_PROMPTS = {
+    "suffix": _QWEN3ASR_CORRECTOR_SUFFIX_SYSTEM_PROMPT,
+    "suffix_beam_switch": _QWEN3ASR_CORRECTOR_SUFFIX_BEAM_SWITCH_SYSTEM_PROMPT,
+    "full_transcript": _QWEN3ASR_CORRECTOR_FULL_TRANSCRIPT_SYSTEM_PROMPT,
+}
 
 
 def _normalize_text(s):
@@ -93,6 +77,27 @@ def _normalize_text(s):
     s = _SPECIAL_TOKEN_RE.sub("", s)
     s = s.replace("\ufffd", "")
     return s
+
+
+def _strip_qwen3asr_transcript_markup(text: str) -> str:
+    """Remove Qwen3-ASR transcript wrappers from corrector generations.
+
+    Dense Qwen3-ASR correctors sometimes answer with the ASR serialization
+    prefix, e.g. ``language Chinese<asr_text>你好``.  For EC output that prefix is
+    transport noise, while a later occurrence indicates a hallucinated format
+    restart and should be discarded with the tail.
+    """
+    s = _normalize_text(text or "")
+    if not s:
+        return ""
+
+    start = re.match(r"\s*language\s+\S+\s*<asr_text>\s*", s, flags=re.IGNORECASE)
+    if start is not None:
+        s = s[start.end():]
+
+    s = re.sub(r"[ \t\n]*language\s+\S+\s*<asr_text>.*", "", s, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"\n`{3}.*", "", s, flags=re.DOTALL)
+    return s.strip()
 
 
 def _strip_intermediate_tail_artifacts(text: str) -> str:
@@ -120,7 +125,9 @@ def _strip_intermediate_tail_artifacts(text: str) -> str:
         while s:
             ch = s[-1]
             cat = unicodedata.category(ch)
-            if ch == "\ufffd" or ch.isspace() or cat.startswith(("P", "C", "Z")):
+            if ch == "\ufffd" or ch.isspace() or (
+                cat.startswith(("P", "C", "Z")) and ch not in _SEMANTIC_PUNCTUATION
+            ):
                 s = s[:-1]
                 changed = True
             else:
@@ -132,18 +139,300 @@ def _strip_intermediate_tail_artifacts(text: str) -> str:
     return s
 
 
+def _is_short_number_truncation(prev_text: str, final_text: str) -> bool:
+    prev_c = _compact_for_acceptance(prev_text)
+    final_c = _compact_for_acceptance(final_text)
+    if not prev_c or not final_c:
+        return False
+    if len(prev_c) > 8 or len(prev_c) <= len(final_c):
+        return False
+    it = iter(prev_c)
+    if not all(ch in it for ch in final_c):
+        return False
+    return _is_numberish(prev_text) and _is_numberish(final_text)
+
+
+def _strip_matching_prefix(text: str, prefix: str) -> str:
+    """Return the suffix of text after prefix, tolerating punctuation-only drift."""
+    text = _normalize_text(text or "")
+    prefix = _normalize_text(prefix or "")
+    if not text or not prefix:
+        return text
+
+    if text.startswith(prefix):
+        return text[len(prefix):]
+
+    # The training/eval normalizer ignores punctuation, but runtime strings may
+    # differ by commas/periods around the prefix boundary.  Keep only a small,
+    # conservative fallback so the corrector cannot duplicate the committed
+    # prefix when it emits a full transcript.
+    def _compact(s: str) -> str:
+        return "".join(
+            ch
+            for ch in s
+            if not (
+                unicodedata.category(ch).startswith(("P", "C", "Z"))
+                and ch not in _SEMANTIC_PUNCTUATION
+            )
+        )
+
+    compact_prefix = _compact(prefix)
+    compact_text = _compact(text)
+    if compact_prefix and compact_text.startswith(compact_prefix):
+        consumed = 0
+        kept = 0
+        for idx, ch in enumerate(text):
+            if not (
+                unicodedata.category(ch).startswith(("P", "C", "Z"))
+                and ch not in _SEMANTIC_PUNCTUATION
+            ):
+                kept += 1
+            if kept >= len(compact_prefix):
+                consumed = idx + 1
+                break
+        return text[consumed:]
+
+    return text
+
+
+def _normalize_corrector_suffix(response: str, previous_text: str, candidates: list[str]) -> str:
+    """Coerce a corrector generation into the suffix expected by the streamer."""
+    suffix = _strip_intermediate_tail_artifacts(_strip_qwen3asr_transcript_markup(response or "")).strip()
+    prev = _strip_intermediate_tail_artifacts(_normalize_text(previous_text or "")).strip()
+    if not suffix:
+        return ""
+
+    suffix = _strip_matching_prefix(suffix, prev).strip()
+    if not suffix:
+        return ""
+
+    def _compact_with_ends(s: str) -> tuple[str, list[int]]:
+        compact_chars = []
+        ends = []
+        for idx, ch in enumerate(s):
+            if (
+                unicodedata.category(ch).startswith(("P", "C", "Z"))
+                and ch not in _SEMANTIC_PUNCTUATION
+            ):
+                continue
+            compact_chars.append(ch)
+            ends.append(idx + 1)
+        return "".join(compact_chars), ends
+
+    compact_prev, _ = _compact_with_ends(prev)
+    compact_suffix, suffix_ends = _compact_with_ends(suffix)
+
+    # A full-transcript generation that is already covered by the committed
+    # prefix is not a suffix. Drop it instead of duplicating the prefix.
+    if compact_prev and compact_suffix and len(compact_suffix) >= 2:
+        if compact_prev.startswith(compact_suffix) or compact_suffix in compact_prev:
+            return ""
+
+    # Some dense Qwen3-ASR corrector checkpoints occasionally answer with a
+    # near-full transcript instead of the requested continuation, e.g. repeating
+    # the prefix with a minor filler/character drift.  The streamer cannot revise
+    # already committed prefix text, so keep only any tail after the part that
+    # aligns to the end of the prefix; if the answer is almost entirely covered by
+    # the prefix, treat it as an empty suffix.
+    if compact_prev and compact_suffix and len(compact_suffix) >= 4:
+        import difflib
+        matcher = difflib.SequenceMatcher(None, compact_prev, compact_suffix)
+        blocks = matcher.get_matching_blocks()
+        covered = sum(block.size for block in blocks)
+        coverage = covered / max(1, len(compact_suffix))
+        end_aligned = [
+            block for block in blocks
+            if block.size > 0 and block.a + block.size == len(compact_prev)
+        ]
+        if end_aligned:
+            block = max(end_aligned, key=lambda b: (b.size, b.b))
+            tail_compact_idx = block.b + block.size
+            if tail_compact_idx >= len(compact_suffix):
+                return ""
+            if coverage >= 0.65:
+                suffix = suffix[suffix_ends[tail_compact_idx - 1]:].strip()
+                if not suffix:
+                    return ""
+        elif coverage >= 0.8:
+            return ""
+
+    # If the model emits a shortened or overlapping full transcript instead of
+    # a pure suffix, append only the part not already covered by the prefix.
+    max_overlap = min(len(compact_prev), len(compact_suffix))
+    for n in range(max_overlap, 0, -1):
+        if compact_prev.endswith(compact_suffix[:n]):
+            suffix = suffix[suffix_ends[n - 1]:].strip()
+            break
+    if not suffix:
+        return ""
+
+    for cand in candidates or []:
+        cand_suffix = _strip_matching_prefix(
+            _strip_intermediate_tail_artifacts(_normalize_text(cand or "")).strip(),
+            prev,
+        ).strip()
+        if cand_suffix and suffix.startswith(cand_suffix + cand_suffix):
+            suffix = cand_suffix
+            break
+
+    return suffix
+
+
+def _normalize_corrector_full_transcript(response: str) -> str:
+    return _strip_qwen3asr_transcript_markup(response or "")
+
+
+def _compact_for_acceptance(text: str) -> str:
+    chars = []
+    for ch in _normalize_text(text or ""):
+        cat = unicodedata.category(ch)
+        if ch.isspace() or (
+            cat.startswith(("P", "C", "Z")) and ch not in _SEMANTIC_PUNCTUATION
+        ):
+            continue
+        chars.append(unicodedata.normalize("NFKC", ch).lower())
+    return "".join(chars)
+
+
+def _edit_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    dp = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        nd = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            nd[j] = min(
+                dp[j] + 1,
+                nd[j - 1] + 1,
+                dp[j - 1] + (0 if ca == cb else 1),
+            )
+        dp = nd
+    return dp[-1]
+
+
+def _is_numberish(text: str) -> bool:
+    s = _compact_for_acceptance(text)
+    if not s:
+        return False
+    numeric_chars = set("0123456789零一二三四五六七八九十百千万亿两幺〇点百分之元块号%％.")
+    numeric = sum(ch in numeric_chars for ch in s)
+    return numeric >= 2 and numeric / max(1, len(s)) >= 0.5
+
+
+def _suffixes_after_prefix(candidates: list[str], previous_text: str) -> list[str]:
+    prev = _strip_intermediate_tail_artifacts(_normalize_text(previous_text or "")).strip()
+    suffixes = []
+    for cand in candidates or []:
+        cand_norm = _strip_intermediate_tail_artifacts(_normalize_text(cand or "")).strip()
+        if not cand_norm:
+            continue
+        suffixes.append(_strip_matching_prefix(cand_norm, prev).strip())
+    return suffixes
+
+
+def _accept_corrector_suffix(
+    corrected_suffix: str,
+    previous_text: str,
+    candidates: list[str],
+    mode: str,
+) -> tuple[bool, str]:
+    """Runtime safety gate for suffix EC.
+
+    This is deliberately conservative and off by default.  It does not choose
+    transcripts manually; it only rejects high-risk EC generations and lets the
+    normal ASR top-1 pass through.  The rule protects the strict streaming
+    interface where an over-short suffix cannot be repaired later.
+    """
+    if mode in {"", "off", None}:
+        return True, "off"
+    if mode not in {"conservative", "conservative_v2"}:
+        return True, f"unknown_mode:{mode}"
+
+    suffixes = _suffixes_after_prefix(candidates, previous_text)
+    top1_suffix = suffixes[0] if suffixes else ""
+    corr = _strip_intermediate_tail_artifacts(_normalize_text(corrected_suffix or "")).strip()
+    top1_c = _compact_for_acceptance(top1_suffix)
+    corr_c = _compact_for_acceptance(corr)
+
+    if corr_c == top1_c:
+        return True, "same_as_top1"
+    if not corr_c:
+        return (not top1_c), "empty_suffix"
+    if mode == "conservative_v2" and not top1_c:
+        # If ASR top-1 has no remaining suffix after the committed prefix,
+        # a non-empty EC suffix is usually a hallucinated tail append. This was
+        # the dominant residual regression pattern for 0.6B suffix EC.
+        return False, "empty_top1_suffix_nonempty_ec"
+
+    top1_len = len(top1_c)
+    corr_len = len(corr_c)
+
+    # One-shot short utterances are high-risk: switching from a correct short
+    # ASR top-1 to another short beam ("一" -> "嗯", "我" -> "嗯") creates large
+    # CER spikes. Let training solve these later; conservative runtime should
+    # preserve top-1 unless the generation is identical.
+    if mode == "conservative_v2" and not _compact_for_acceptance(previous_text) and top1_len <= 2:
+        return False, "short_initial_switch"
+
+    # Number-like suffixes are high-cost mistakes; only allow punctuation-only
+    # changes in conservative mode.
+    if _is_numberish(top1_suffix) or _is_numberish(corr):
+        return False, "numberish_changed"
+
+    # Most observed 0.6B regressions are deletions/shortening of already-good
+    # top-1 continuations, especially short repeated utterances.
+    if corr_len < top1_len:
+        if top1_len <= 8:
+            return False, "short_suffix_shrink"
+        deletion = top1_len - corr_len
+        if deletion >= max(2, int(round(top1_len * 0.2))):
+            return False, "large_suffix_shrink"
+
+    # Avoid over-generating from tiny final candidates.
+    if top1_len <= 3 and corr_len > top1_len + 2:
+        return False, "tiny_top1_overgenerate"
+
+    # Keep accepted generations close to at least one ASR beam suffix.  This
+    # still permits small generative fixes such as homophones, but rejects freer
+    # rewrites that current 0.6B suffix models often get wrong.
+    cand_compacts = [_compact_for_acceptance(s) for s in suffixes if _compact_for_acceptance(s)]
+    if cand_compacts:
+        best_dist = min(_edit_distance(corr_c, c) for c in cand_compacts)
+        best_ratio = best_dist / max(1, len(corr_c), min(len(c) for c in cand_compacts))
+        if best_ratio > 0.35:
+            return False, f"far_from_candidates:{best_ratio:.2f}"
+
+    return True, "accepted"
+
+
+def _recent_audio_window(audio_np, seconds: float = 0.5, min_samples: int = 1600):
+    audio = np.asarray(audio_np, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=0) if audio.shape[0] <= 2 else audio[0]
+    if audio.shape[0] <= min_samples:
+        return audio
+    n = max(min_samples, int(round(seconds * 16000)))
+    return audio[-min(n, audio.shape[0]):]
+
+
 def _build_qwen3asr_candidates_text(candidates):
     body = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(candidates)) + "\n"
     return f"<candidates>\n{body}</candidates>"
 
 
-def _build_qwen3asr_corrector_prompt(candidates, previous_text):
+def _build_qwen3asr_corrector_prompt(candidates, previous_text, output_mode="suffix"):
+    if output_mode not in _QWEN3ASR_CORRECTOR_SYSTEM_PROMPTS:
+        raise ValueError(f"Unsupported Qwen3-ASR corrector output_mode: {output_mode}")
     user_body = "<|audio_start|><|audio_pad|><|audio_end|>\n"
-    if previous_text:
+    if output_mode.startswith("suffix") and previous_text:
         user_body += f"Previous: {previous_text}\n"
     user_body += _build_qwen3asr_candidates_text(candidates)
     return (
-        f"<|im_start|>system\n{_QWEN3ASR_CORRECTOR_SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>system\n{_QWEN3ASR_CORRECTOR_SYSTEM_PROMPTS[output_mode]}<|im_end|>\n"
         f"<|im_start|>user\n{user_body}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -182,6 +471,44 @@ def qwen3asr_args(parser):
         '--error-corrector-type', type=str, choices=['speechlm', 'lm', 'qwen3asr'], default='speechlm',
         help='Corrector type: "speechlm" (audio+text), "lm" (text-only), or "qwen3asr" (Qwen3-ASR-0.6B LoRA).',
     )
+    ec.add_argument(
+        '--error-corrector-audio-window',
+        type=str,
+        choices=['runtime', 'cumulative'],
+        default='runtime',
+        help='Audio window passed to the error corrector. "runtime" preserves the current chunk/final window; '
+             '"cumulative" passes all speech audio in the VAD segment, matching SpeechLM ver3 training.',
+    )
+    ec.add_argument(
+        '--error-corrector-max-new-tokens',
+        type=int,
+        default=16,
+        help='Maximum new tokens for Qwen3-ASR error-corrector suffix generation. (default: 16)',
+    )
+    ec.add_argument(
+        '--error-corrector-output-mode',
+        type=str,
+        choices=['suffix', 'suffix_beam_switch', 'full_transcript'],
+        default='suffix',
+        help='Qwen3-ASR corrector generation target. full_transcript is applied only at finish().',
+    )
+    ec.add_argument(
+        '--error-corrector-scope',
+        type=str,
+        choices=['all', 'finish'],
+        default='all',
+        help='When to run the error corrector. "all" runs on process_iter and finish; '
+             '"finish" leaves streaming ASR state untouched and corrects only final flushes.',
+    )
+    ec.add_argument(
+        '--error-corrector-acceptance-mode',
+        type=str,
+        choices=['off', 'conservative', 'conservative_v2'],
+        default='off',
+        help='Optional suffix EC safety gate. "off" preserves reproduction behavior; '
+             '"conservative" rejects high-risk suffix rewrites and falls back to ASR top-1. '
+             '"conservative_v2" additionally rejects empty-top1 tail appends and short initial switches.',
+    )
 
 
 
@@ -194,6 +521,12 @@ def qwen3_asr_factory(args):
         logdir=getattr(args, 'output_dir', None),
         initial_buffer=args.initial_buffer,
         beam_block_size=args.beam_block_size,
+        seed=getattr(args, 'seed', 42),
+        error_corrector_audio_window=getattr(args, 'error_corrector_audio_window', 'runtime'),
+        error_corrector_max_new_tokens=getattr(args, 'error_corrector_max_new_tokens', 16),
+        error_corrector_output_mode=getattr(args, 'error_corrector_output_mode', 'suffix'),
+        error_corrector_scope=getattr(args, 'error_corrector_scope', 'all'),
+        error_corrector_acceptance_mode=getattr(args, 'error_corrector_acceptance_mode', 'off'),
     )
     return asr, Qwen3ASROnline(asr)
 
@@ -202,12 +535,32 @@ class Qwen3ASRBackendASR(ASRBase):
 
     sep = ''
 
-    def __init__(self, language, model_path, beams, logdir, initial_buffer=1.0, beam_block_size="auto"):
+    def __init__(
+        self,
+        language,
+        model_path,
+        beams,
+        logdir,
+        initial_buffer=1.0,
+        beam_block_size="auto",
+        seed=42,
+        error_corrector_audio_window="runtime",
+        error_corrector_max_new_tokens=16,
+        error_corrector_output_mode="suffix",
+        error_corrector_scope="all",
+        error_corrector_acceptance_mode="off",
+    ):
         self.language = language
         self.beams = beams
         self.logdir = logdir
         self.initial_buffer = initial_buffer
         self.beam_block_size = beam_block_size
+        self.seed = seed
+        self.error_corrector_audio_window = error_corrector_audio_window
+        self.error_corrector_max_new_tokens = error_corrector_max_new_tokens
+        self.error_corrector_output_mode = error_corrector_output_mode
+        self.error_corrector_scope = error_corrector_scope
+        self.error_corrector_acceptance_mode = error_corrector_acceptance_mode
         self.force_language = LANG_CODE_TO_NAME.get(language)
 
         from qwen_asr.inference.qwen3_asr import Qwen3ASRModel
@@ -231,63 +584,20 @@ class Qwen3ASRBackendASR(ASRBase):
             max_num_seqs=max(2 * beams, 8),
             max_model_len=4096,
             enable_prefix_caching=True,
-            disable_log_stats=True
+            disable_log_stats=True,
+            seed=seed,
         )
         logger.info(f'Language: {language} -> {self.force_language}')
-        self._timing: Optional[_StreamTiming] = None
-        self._original_generate = None
-
-    def start_latency_tracking(self) -> None:
-        self._timing = _StreamTiming()
-        if self._original_generate is None:
-            self._original_generate = self.qwen3.model.generate
-
-        timing = self._timing
-
-        def generate_with_timing(*args, **kwargs):
-            outputs = self._original_generate(*args, **kwargs)
-            if timing is not None:
-                timing.last_generate_end_ts = time.perf_counter()
-            return outputs
-
-        self.qwen3.model.generate = generate_with_timing
-
-    def stop_latency_tracking(self) -> StreamLatency:
-        if self._original_generate is not None:
-            self.qwen3.model.generate = self._original_generate
-        timing = self._timing
-        self._timing = None
-        if timing is None:
-            return StreamLatency()
-        return timing.finalize()
-
-    def note_audio_fed(self, pcm: np.ndarray) -> None:
-        if self._timing is None:
-            return
-        fed_ts = time.perf_counter()
-        self._timing.last_audio_fed_ts = fed_ts
-        if _is_non_silent(pcm) and self._timing.ftl_start_ts is None:
-            self._timing.ftl_start_ts = fed_ts
-
-    def _note_transcript(self, candidates) -> None:
-        if self._timing is None or not candidates:
-            return
-        text = (candidates[0] or "").strip()
-        if (
-            self._timing.ftl_start_ts is not None
-            and self._timing.ftl_end_ts is None
-            and text
-            and self._timing.last_generate_end_ts is not None
-        ):
-            self._timing.ftl_end_ts = self._timing.last_generate_end_ts
 
     def init_state(self):
         """Initializes a custom streaming state for pseudo-streaming via HuggingFace."""
         import numpy as np
+        unfixed_chunk_num = int(os.environ.get('QWEN3_UNFIXED_CHUNK_NUM', '0'))
+        unfixed_token_num = int(os.environ.get('QWEN3_UNFIXED_TOKEN_NUM', '0'))
         return {
             'chunk_id': 0,
-            'unfixed_chunk_num': 0,
-            'unfixed_token_num': 0,
+            'unfixed_chunk_num': unfixed_chunk_num,
+            'unfixed_token_num': unfixed_token_num,
             'audio_accum': np.zeros(0, dtype=np.float32),
             '_raw_decoded': ''
         }
@@ -323,7 +633,6 @@ class Qwen3ASRBackendASR(ASRBase):
                     next_raw = _strip_intermediate_tail_artifacts(next_raw)
                 state['_raw_decoded'] = next_raw
                 state['chunk_id'] += 1
-                self._note_transcript(candidates)
         except Exception as e:
             import traceback
             logger.warning(f'Beam search failed ({e})\n{traceback.format_exc()}\nfalling back to greedy')
@@ -335,7 +644,6 @@ class Qwen3ASRBackendASR(ASRBase):
             candidates = [_normalize_text(text)]
             state['_raw_decoded'] = text
             state['chunk_id'] += 1
-            self._note_transcript(candidates)
 
         return candidates, state, beam_prefix
 
@@ -564,26 +872,11 @@ class Qwen3ASRBackendASR(ASRBase):
         return candidates, best_raw_decoded, prefix
 
     def warmup(self, audio, init_prompt=''):
-        logger.info('Warming up Qwen3-ASR (offline)...')
+        logger.info('Warming up Qwen3-ASR...')
         results = self.qwen3.transcribe(
             audio=(audio, 16000), language=self.force_language,
         )
         logger.info(f'Warmup result: {results[0].text}')
-
-    def warmup_streaming(self, audio, chunk_size_sec: float = 0.5) -> None:
-        """Untimed streaming warmup via infer_chunk to match measured inference path."""
-        logger.info('Warming up Qwen3-ASR streaming (beam)...')
-        audio_np = np.asarray(audio, dtype=np.float32).reshape(-1)
-        step = max(1, int(round(chunk_size_sec * SAMPLE_RATE)))
-        state = self.init_state()
-        pos = 0
-        while pos < audio_np.shape[0]:
-            chunk = audio_np[pos : pos + step]
-            pos += chunk.shape[0]
-            self.infer_chunk(chunk, state, is_last=False)
-        if state['audio_accum'].shape[0] > 0:
-            self.infer_chunk(np.zeros((0,), dtype=np.float32), state, is_last=True)
-        logger.info('Streaming warmup complete.')
 
     def transcribe(self, audio, init_prompt=''):
         raise NotImplementedError('Use Qwen3ASROnline.process_iter()')
@@ -697,24 +990,58 @@ class Qwen3ASROnline(OnlineProcessorInterface):
                 hist_candidates = [c for c in hist_candidates if c] or [candidates[0]]
 
             corrected_top1 = hist_candidates[0] if hist_candidates else candidates[0]
-            if corrector_model is not None and all_audio_arr.shape[0] >= 1600:
+            ec_debug = None
+            if (
+                corrector_model is not None
+                and all_audio_arr.shape[0] >= 1600
+                and self.asr.error_corrector_output_mode.startswith("suffix")
+                and self.asr.error_corrector_scope == "all"
+            ):
+                corrector_audio = (
+                    all_audio_arr
+                    if self.asr.error_corrector_audio_window == "cumulative"
+                    else feed_audio
+                )
                 corrected_suffix = _run_error_corrector(
-                    audio_np=all_audio_arr,
+                    audio_np=corrector_audio,
                     candidates=hist_candidates,
                     previous_text=beam_prefix,
                     corrector_model=corrector_model,
                     corrector_processor=corrector_processor,
                     corrector_type=corrector_type,
+                    max_new_tokens=self.asr.error_corrector_max_new_tokens,
+                    output_mode="suffix",
+                    return_debug=True,
                 )
+                if isinstance(corrected_suffix, dict):
+                    ec_debug = corrected_suffix
+                    corrected_suffix = ec_debug.get("response")
                 if corrected_suffix is not None:
-                    corrected_top1 = beam_prefix + corrected_suffix
+                    accepted, reason = _accept_corrector_suffix(
+                        corrected_suffix,
+                        previous_text=beam_prefix,
+                        candidates=hist_candidates,
+                        mode=self.asr.error_corrector_acceptance_mode,
+                    )
+                    if accepted:
+                        corrected_top1 = beam_prefix + corrected_suffix
+                    else:
+                        print(f"[EC gate] rejected process_iter suffix: {reason}")
+                    if ec_debug is not None:
+                        ec_debug["accepted"] = accepted
+                        ec_debug["accept_reason"] = reason
+                        ec_debug["applied_text"] = corrected_top1
 
-            self._beam_history.append({
+            history_entry = {
+                "segment_offset": float(self.offset),
                 "end_time": float(self.end),
                 "previous_transcript": str(beam_prefix),
                 "topk": list(hist_candidates),
                 "source": "process_iter",
-            })
+            }
+            if ec_debug is not None:
+                history_entry["error_corrector"] = ec_debug
+            self._beam_history.append(history_entry)
             self._last_top1_in_segment = corrected_top1 if corrected_top1 else self._last_top1_in_segment
 
         self.frame_delay = True
@@ -748,13 +1075,16 @@ class Qwen3ASROnline(OnlineProcessorInterface):
             candidates = self.last_candidates
             beam_prefix = self.last_beam_prefix
 
+        finish_history_entry = None
         if candidates:
-            self._beam_history.append({
+            finish_history_entry = {
+                'segment_offset': float(self.offset),
                 'end_time': float(self.end),
                 'previous_transcript': str(beam_prefix),
                 'topk': list(candidates),
                 'source': 'finish',
-            })
+            }
+            self._beam_history.append(finish_history_entry)
             # Note: _last_top1_in_segment will be updated below after
             # the corrector runs (if enabled), so we don't set it from
             # the raw candidate here.
@@ -764,22 +1094,80 @@ class Qwen3ASROnline(OnlineProcessorInterface):
         full_text = ''
         if candidates and not all(c.strip() == '' for c in candidates):
             top1_text = candidates[0].strip()
+            raw_top1_text = top1_text
+            fallback_reason = None
+            if (
+                self.last_candidates
+                and self.last_candidates[0].strip()
+                and _is_short_number_truncation(self.last_candidates[0], top1_text)
+            ):
+                top1_text = self.last_candidates[0].strip()
+                fallback_reason = "short_number_final_truncation"
 
             if corrector_model is not None and all_audio_arr.shape[0] >= 1600:
-                corrected_suffix = _run_error_corrector(
-                    audio_np=all_audio_arr,
+                if self.asr.error_corrector_audio_window == "cumulative":
+                    corrector_audio = all_audio_arr
+                else:
+                    corrector_audio = (
+                        new_audio
+                        if new_audio is not None and new_audio.shape[0] >= 1600
+                        else _recent_audio_window(all_audio_arr)
+                    )
+                corrected_text = _run_error_corrector(
+                    audio_np=corrector_audio,
                     candidates=candidates,
                     previous_text=beam_prefix,
                     corrector_model=corrector_model,
                     corrector_processor=corrector_processor,
                     corrector_type=corrector_type,
+                    max_new_tokens=self.asr.error_corrector_max_new_tokens,
+                    output_mode=self.asr.error_corrector_output_mode,
+                    return_debug=True,
                 )
-                if corrected_suffix is not None:
-                    full_text = beam_prefix + corrected_suffix
+                ec_debug = corrected_text if isinstance(corrected_text, dict) else None
+                if ec_debug is not None:
+                    corrected_text = ec_debug.get("response")
+                if corrected_text is not None:
+                    if self.asr.error_corrector_output_mode == "full_transcript":
+                        full_text = corrected_text
+                        accepted, reason = True, "full_transcript"
+                    else:
+                        top1_suffix = _strip_intermediate_tail_artifacts(
+                            _strip_matching_prefix(top1_text, beam_prefix)
+                        ).strip()
+                        accepted, reason = _accept_corrector_suffix(
+                            corrected_text,
+                            previous_text=beam_prefix,
+                            candidates=candidates,
+                            mode=self.asr.error_corrector_acceptance_mode,
+                        )
+                        # Empty suffix is a valid stop signal only when the
+                        # beam prefix already covers top-1.  For one-shot short
+                        # utterances beam_prefix is often empty; accepting an
+                        # empty EC output there deletes the ASR hypothesis.
+                        if not accepted:
+                            print(f"[EC gate] rejected finish suffix: {reason}")
+                            full_text = top1_text
+                        elif not corrected_text and top1_suffix:
+                            full_text = top1_text
+                        else:
+                            full_text = beam_prefix + corrected_text
+                    if ec_debug is not None:
+                        ec_debug["accepted"] = accepted
+                        ec_debug["accept_reason"] = reason
+                        ec_debug["applied_text"] = full_text
+                        if finish_history_entry is not None:
+                            finish_history_entry["error_corrector"] = ec_debug
                 else:
                     full_text = top1_text
             else:
                 full_text = top1_text
+            if fallback_reason and finish_history_entry is not None:
+                finish_history_entry["finish_fallback"] = {
+                    "reason": fallback_reason,
+                    "raw_top1": raw_top1_text,
+                    "applied_top1": top1_text,
+                }
 
         if full_text:
             self._last_top1_in_segment = full_text
@@ -793,6 +1181,10 @@ class Qwen3ASROnline(OnlineProcessorInterface):
                 delta = full_text[match.b + match.size:]
             else:
                 delta = full_text
+
+        if not self._first_token_generated and start_time is not None and delta:
+            self.first_token_latency = time.time() - start_time
+            self._first_token_generated = True
 
         saved_offset = self.offset
         saved_end = self.end
@@ -859,6 +1251,9 @@ def _run_error_corrector(
     audio_np, candidates, previous_text,
     corrector_model, corrector_processor, corrector_type,
     return_confidence=False,
+    max_new_tokens=16,
+    output_mode="suffix",
+    return_debug=False,
 ):
     """Run the SpeechLM, LM, or Qwen3-ASR corrector on top-k candidates."""
     prev_display = previous_text
@@ -872,6 +1267,14 @@ def _run_error_corrector(
         if text.strip():
             cleaned.append(text)
     if not cleaned:
+        if return_debug:
+            return {
+                "type": corrector_type,
+                "output_mode": output_mode,
+                "raw_response": None,
+                "response": None,
+                "confidence": None,
+            }
         return (None, None) if return_confidence else None
 
     # ---- LM (text-only) corrector ----
@@ -908,11 +1311,19 @@ def _run_error_corrector(
         print(f'Candidates: {cleaned}')
         print(f'Corrected suffix: {response}')
         print('=======================================')
+        if return_debug:
+            return {
+                "type": "lm",
+                "output_mode": output_mode,
+                "raw_response": response,
+                "response": response,
+                "confidence": confidence,
+            }
         return (response, confidence) if return_confidence else response
 
     # ---- Qwen3-ASR corrector (audio + text, aligned with Qwen3ASRCorrector training) ----
     if corrector_type == 'qwen3asr':
-        prompt = _build_qwen3asr_corrector_prompt(cleaned, prev_display)
+        prompt = _build_qwen3asr_corrector_prompt(cleaned, prev_display, output_mode)
         audio_array = np.asarray(audio_np, dtype=np.float32)
         if audio_array.ndim > 1:
             audio_array = audio_array.mean(axis=0) if audio_array.shape[0] <= 2 else audio_array[0]
@@ -941,7 +1352,7 @@ def _run_error_corrector(
         with torch.no_grad():
             gen_out = corrector_model.generate(
                 **inputs,
-                max_new_tokens=64,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
                 output_scores=return_confidence,
                 return_dict_in_generate=return_confidence,
@@ -958,14 +1369,27 @@ def _run_error_corrector(
             if tid == eos_id:
                 stop_at = i
                 break
-        response = tokenizer.decode(new_tokens[:stop_at], skip_special_tokens=True).strip()
+        raw_response = tokenizer.decode(new_tokens[:stop_at], skip_special_tokens=True).strip()
+        if output_mode == "full_transcript":
+            response = _normalize_corrector_full_transcript(raw_response)
+        else:
+            response = _normalize_corrector_suffix(raw_response, prev_display, cleaned)
         confidence = _token_confidence(gen_out, gen[0, input_length:]) if return_confidence else None
 
         print('========= QWEN3ASR CORRECTOR ==========')
         print(f'Previous: {prev_display}')
         print(f'Candidates: {cleaned}')
-        print(f'Corrected suffix: {response}')
+        print(f'Raw response: {raw_response}')
+        print(f'Corrected {output_mode}: {response}')
         print('=======================================')
+        if return_debug:
+            return {
+                "type": "qwen3asr",
+                "output_mode": output_mode,
+                "raw_response": raw_response,
+                "response": response,
+                "confidence": confidence,
+            }
         return (response, confidence) if return_confidence else response
 
     # ---- SpeechLM corrector (audio + text) ----
@@ -1034,6 +1458,14 @@ def _run_error_corrector(
     print(f'Candidates: {cleaned}')
     print(f'Corrected suffix: {response}')
     print('========================================')
+    if return_debug:
+        return {
+            "type": "speechlm",
+            "output_mode": output_mode,
+            "raw_response": response,
+            "response": response,
+            "confidence": confidence,
+        }
     return (response, confidence) if return_confidence else response
 
 

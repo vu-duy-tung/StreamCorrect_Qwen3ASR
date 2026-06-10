@@ -37,13 +37,6 @@ def load_audio_chunk(fname, beg, end):
     return audio[beg_s:end_s]
 
 
-def _warmup_asr(asr, audio, chunk_size_sec: float = 0.5) -> None:
-    if hasattr(asr, 'warmup_streaming'):
-        asr.warmup_streaming(audio, chunk_size_sec=chunk_size_sec)
-    else:
-        asr.warmup(audio)
-
-
 def processor_args(parser):
     group = parser.add_argument_group("Streaming")
     group.add_argument(
@@ -76,6 +69,10 @@ def asr_factory(args, factory):
         error_corrector_ckpt=getattr(args, 'error_corrector_ckpt', None),
         error_corrector_base_model=getattr(args, 'error_corrector_base_model', None),
         error_corrector_type=getattr(args, 'error_corrector_type', 'speechlm'),
+        error_corrector_audio_window=getattr(args, 'error_corrector_audio_window', 'runtime'),
+        error_corrector_output_mode=getattr(args, 'error_corrector_output_mode', 'suffix'),
+        error_corrector_scope=getattr(args, 'error_corrector_scope', 'all'),
+        error_corrector_acceptance_mode=getattr(args, 'error_corrector_acceptance_mode', 'off'),
     )
     return asr, online
 
@@ -106,6 +103,18 @@ def simulation_args(parser):
         '--reference-file', type=str, default=None,
         help='Path to transcript JSON (list of {audio_path, text_zh}) for automatic CER evaluation.',
     )
+    parser.add_argument(
+        '--reference-audio-list', action='store_true',
+        help='Batch mode only: process audio_path entries from --reference-file instead of scanning audio_path directory.',
+    )
+    parser.add_argument(
+        '--seed', type=int, default=42,
+        help='Random seed for reproducible evaluation. (default: 42)',
+    )
+    parser.add_argument(
+        '--skip-existing-beam-history', action='store_true',
+        help='Batch mode only: skip files whose *_beam_history.json already exists in output-dir.',
+    )
 
 
 def get_audio_files(path):
@@ -123,6 +132,27 @@ def get_audio_files(path):
         raise ValueError(f"Path does not exist: {path}")
 
 
+def get_audio_files_from_reference(reference_file, audio_root=None):
+    if not reference_file:
+        raise ValueError("--reference-audio-list requires --reference-file")
+    with open(reference_file, encoding='utf-8') as f:
+        data = json.load(f)
+    files = []
+    for row in data:
+        path = str(row.get('audio_path', '') or '')
+        if not path:
+            continue
+        if not os.path.isabs(path) and audio_root:
+            path = os.path.join(audio_root, path)
+        files.append(path)
+    missing = [p for p in files if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing {len(missing)} audio files listed in {reference_file}; first: {missing[0]}"
+        )
+    return files
+
+
 def _worker_process_files(worker_id, gpu_id, audio_files, args_dict, factory_module, factory_name):
     import argparse, importlib
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -135,7 +165,7 @@ def _worker_process_files(worker_id, gpu_id, audio_files, args_dict, factory_mod
     logger_w.info(f"Starting with {len(audio_files)} files")
     asr, online = asr_factory(args, factory)
     if audio_files:
-        _warmup_asr(asr, load_audio_chunk(audio_files[0], 0, 1), chunk_size_sec=args.chunk_size)
+        asr.warmup(load_audio_chunk(audio_files[0], 0, 1))
     results = []
     for idx, f in enumerate(audio_files, 1):
         logger_w.info(f"[{idx}/{len(audio_files)}] {os.path.basename(f)}")
@@ -144,8 +174,8 @@ def _worker_process_files(worker_id, gpu_id, audio_files, args_dict, factory_mod
         except Exception as e:
             import traceback; traceback.print_exc()
             results.append({'file': f, 'duration': 0, 'segments': [],
-                            'final_text': '', 'ftl_ms': None,
-                            'ltl_ms': None, 'error': str(e)})
+                            'final_text': '', 'first_token_latency': None,
+                            'last_token_latency': None, 'error': str(e)})
     try:
         from vllm.distributed import destroy_model_parallel
         destroy_model_parallel()
@@ -222,35 +252,41 @@ def process_single_audio_file(audio_path, args, asr, online, min_chunk, factory)
     duration = len(load_audio(audio_path)) / SAMPLING_RATE
     logger.info(f"Processing: {os.path.basename(audio_path)} ({duration:.2f}s)")
 
-    if hasattr(asr, 'start_latency_tracking'):
-        asr.start_latency_tracking()
-
     beg = 0.0
     end = beg + min_chunk
+    start_time = None
     all_transcriptions = []
+    first_token_latency = None
+    last_token_latency = None
+    last_speech_end = None
 
     def output_transcript(o, now=None):
         if 'start' in o:
             ts = o['start']; te = o['end']; text = o['text']
-            t = now if now is not None else (time.perf_counter() - _proc_start)
+            t = now if now is not None else (time.time() - _proc_start)
             logger.debug(f"{t*1000:.1f} {ts*1000:.0f} {te*1000:.0f} {text}")
             print(f"{t*1000:.4f} {ts*1000:.0f} {te*1000:.0f} {text}", flush=True)
             all_transcriptions.append({'emission_time': t, 'start': ts, 'end': te, 'text': text.strip()})
 
-    _proc_start = time.perf_counter()
+    _proc_start = time.time()
 
     # Computationally-unaware simulation: feed audio in fixed chunks without real-time pacing.
     while True:
         a = load_audio_chunk(audio_path, beg, end)
-        if hasattr(asr, 'note_audio_fed'):
-            asr.note_audio_fed(a)
         online.insert_audio_chunk(a)
+        if start_time is None:
+            start_time = time.time()
+        last_speech_end = time.time()
         try:
-            o = online.process_iter()
+            o = online.process_iter(start_time=start_time)
+            if first_token_latency is None and o.get('first_token_latency') is not None:
+                first_token_latency = o['first_token_latency']
         except AssertionError as e:
             logger.error(f"assertion error: {e}")
             o = {}
         output_transcript(o, now=end)
+        if 'text' in o:
+            last_token_latency = time.time() - last_speech_end
         if end >= duration:
             break
         beg = end
@@ -259,22 +295,23 @@ def process_single_audio_file(audio_path, args, asr, online, min_chunk, factory)
     # Flush remaining audio.
     print(online.online.frame_delay)
     get_remained = online.online.frame_delay
-    o = online.finish()
+    o = online.finish(start_time=start_time)
+    if first_token_latency is None and o.get('first_token_latency') is not None:
+        first_token_latency = o['first_token_latency']
     if hasattr(online, 'is_currently_final'):
         online.is_currently_final = False
     if not get_remained and o and o.get('text'):
         get_remained = True
+        last_speech_end = time.time()
     if get_remained:
         output_transcript(o)
+        if 'text' in o:
+            last_token_latency = time.time() - last_speech_end
 
-    latency = asr.stop_latency_tracking() if hasattr(asr, 'stop_latency_tracking') else None
-    ftl_ms = latency.ftl_ms if latency is not None else None
-    ltl_ms = latency.ltl_ms if latency is not None else None
-
-    if ftl_ms is not None:
-        print(f"\nFirst Token Latency: {ftl_ms:.2f} ms")
-    if ltl_ms is not None:
-        print(f"Last Token Latency:  {ltl_ms:.2f} ms")
+    if first_token_latency is not None:
+        print(f"\nFirst Token Latency: {first_token_latency*1000:.2f} ms")
+    if last_token_latency is not None:
+        print(f"Last Token Latency:  {last_token_latency*1000:.2f} ms")
 
     final_text = ' '.join(s['text'] for s in all_transcriptions)
     if final_text:
@@ -287,14 +324,15 @@ def process_single_audio_file(audio_path, args, asr, online, min_chunk, factory)
             base = os.path.splitext(os.path.basename(audio_path))[0]
             with open(os.path.join(output_dir, f"{base}_beam_history.json"), 'w', encoding='utf-8') as f:
                 json.dump({'audio_path': audio_path, 'duration': duration, 'final_text': final_text,
-                           'ftl_ms': ftl_ms,
-                           'ltl_ms': ltl_ms,
+                           'first_token_latency_ms': first_token_latency*1000 if first_token_latency else None,
+                           'last_token_latency_ms': last_token_latency*1000 if last_token_latency else None,
                            'history': inner.get_beam_history()}, f, indent=2, ensure_ascii=False)
         except Exception as e:
             logger.warning(f"Failed to write beam history: {e}")
 
     return {'file': audio_path, 'duration': duration, 'segments': all_transcriptions,
-            'final_text': final_text, 'ftl_ms': ftl_ms, 'ltl_ms': ltl_ms}
+            'final_text': final_text, 'first_token_latency': first_token_latency,
+            'last_token_latency': last_token_latency}
 
 
 def _cleanup_vllm():
@@ -318,17 +356,17 @@ def _save_batch_results(batch_results, audio_files, output_dir, reference_file, 
     if not output_dir:
         return
     os.makedirs(output_dir, exist_ok=True)
-    ftl = [r['ftl_ms'] for r in batch_results if r.get('ftl_ms') is not None]
-    ltl = [r['ltl_ms'] for r in batch_results if r.get('ltl_ms') is not None]
+    ftl = [r['first_token_latency'] for r in batch_results if r.get('first_token_latency')]
+    ltl = [r['last_token_latency'] for r in batch_results if r.get('last_token_latency')]
     summary = {
         'total_files': len(audio_files),
         'processed_files': len(batch_results),
-        'average_ftl_ms': sum(ftl)/len(ftl) if ftl else None,
-        'average_ltl_ms': sum(ltl)/len(ltl) if ltl else None,
+        'average_first_token_latency_ms': sum(ftl)/len(ftl)*1000 if ftl else None,
+        'average_last_token_latency_ms': sum(ltl)/len(ltl)*1000 if ltl else None,
         'results': [{'file': os.path.basename(r['file']), 'duration': r['duration'],
                      'transcription': r['final_text'],
-                     'ftl_ms': r.get('ftl_ms'),
-                     'ltl_ms': r.get('ltl_ms')}
+                     'first_token_latency_ms': r['first_token_latency']*1000 if r.get('first_token_latency') else None,
+                     'last_token_latency_ms': r['last_token_latency']*1000 if r.get('last_token_latency') else None}
                     for r in batch_results]
     }
     with open(os.path.join(output_dir, 'batch_transcriptions.json'), 'w', encoding='utf-8') as f:
@@ -341,24 +379,18 @@ def _save_batch_results(batch_results, audio_files, output_dir, reference_file, 
         from evaluate import load_references, evaluate_transcriptions
         refs = load_references(reference_file, language=language)
         generated = {os.path.basename(r['file']): r['final_text'] for r in batch_results}
-        ftl_map = {os.path.basename(r['file']): r.get('ftl_ms') for r in batch_results if r.get('ftl_ms') is not None}
-        ltl_map = {os.path.basename(r['file']): r.get('ltl_ms') for r in batch_results if r.get('ltl_ms') is not None}
+        ftl_map = {os.path.basename(r['file']): r['first_token_latency'] for r in batch_results if r.get('first_token_latency')}
+        ltl_map = {os.path.basename(r['file']): r['last_token_latency'] for r in batch_results if r.get('last_token_latency')}
         eval_results = evaluate_transcriptions(refs, generated, language)
-        eval_results['average_ftl_ms'] = sum(ftl)/len(ftl) if ftl else None
-        eval_results['average_ltl_ms'] = sum(ltl)/len(ltl) if ltl else None
+        eval_results['average_first_token_latency_ms'] = sum(ftl)/len(ftl)*1000 if ftl else None
+        eval_results['average_last_token_latency_ms'] = sum(ltl)/len(ltl)*1000 if ltl else None
         for row in eval_results['per_file_results']:
             fn = row['file']
-            if fn in ftl_map:
-                row['ftl_ms'] = ftl_map[fn]
-            if fn in ltl_map:
-                row['ltl_ms'] = ltl_map[fn]
+            if fn in ftl_map: row['first_token_latency_ms'] = ftl_map[fn]*1000
+            if fn in ltl_map: row['last_token_latency_ms'] = ltl_map[fn]*1000
         print("\n" + "="*80 + "\nEVALUATION RESULTS\n" + "="*80)
         print(f"Matched: {eval_results['matched_files']} / {eval_results['total_files']}")
         print(f"CER: {eval_results['average_cer']*100:.2f}%   MER: {eval_results['average_mer']*100:.2f}%")
-        if eval_results.get('average_ftl_ms') is not None:
-            print(f"Average FTL: {eval_results['average_ftl_ms']:.1f} ms")
-        if eval_results.get('average_ltl_ms') is not None:
-            print(f"Average LTL: {eval_results['average_ltl_ms']:.1f} ms")
         print("="*80)
         with open(os.path.join(output_dir, 'evaluation_results.json'), 'w', encoding='utf-8') as f:
             json.dump(eval_results, f, indent=2, ensure_ascii=False)
@@ -378,18 +410,46 @@ def main_simulation_from_file(factory, add_args=None):
     args = parser.parse_args()
 
     set_logging(args, logger)
-    random_seed(21)
+    random_seed(args.seed)
 
     audio_path = args.audio_path
     is_directory = os.path.isdir(audio_path)
 
     if is_directory:
-        audio_files = get_audio_files(audio_path)
+        audio_files = (
+            get_audio_files_from_reference(
+                args.reference_file,
+                audio_root=audio_path if is_directory else None,
+            )
+            if args.reference_audio_list
+            else get_audio_files(audio_path)
+        )
         if not audio_files:
             logger.error(f"No audio files found in: {audio_path}")
             sys.exit(1)
         if args.max_files:
             audio_files = audio_files[:args.max_files]
+        if args.skip_existing_beam_history and args.output_dir:
+            original_count = len(audio_files)
+            pending = []
+            for f in audio_files:
+                base = os.path.splitext(os.path.basename(f))[0]
+                history_path = os.path.join(args.output_dir, f"{base}_beam_history.json")
+                if not os.path.isfile(history_path):
+                    pending.append(f)
+            audio_files = pending
+            logger.info(
+                "Resume mode: skipped %d files with existing beam histories; %d pending",
+                original_count - len(audio_files), len(audio_files),
+            )
+            if not audio_files:
+                logger.info("No pending files after resume filtering.")
+                _cleanup_vllm()
+                try:
+                    sys.stdout.flush(); sys.stderr.flush()
+                except Exception:
+                    pass
+                os._exit(0)
         logger.info(f"Batch mode: {len(audio_files)} files")
 
         gpu_list = [g.strip() for g in args.gpus.split(',')]
@@ -400,8 +460,11 @@ def main_simulation_from_file(factory, add_args=None):
                 audio_files, args, factory.__module__, factory.__name__, num_workers, gpu_list
             )
         else:
+            if gpu_list:
+                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_list[0]
+                logger.info("Single-worker batch: CUDA_VISIBLE_DEVICES=%s", gpu_list[0])
             asr, online = asr_factory(args, factory)
-            _warmup_asr(asr, load_audio_chunk(audio_files[0], 0, 1), chunk_size_sec=args.chunk_size)
+            asr.warmup(load_audio_chunk(audio_files[0], 0, 1))
             batch_results = []
             for idx, f in enumerate(audio_files, 1):
                 logger.info(f"[{idx}/{len(audio_files)}] {os.path.basename(f)}")
@@ -420,7 +483,7 @@ def main_simulation_from_file(factory, add_args=None):
         duration = len(load_audio(audio_path)) / 16000
         logger.info(f"Duration: {duration:.2f}s")
         asr, online = asr_factory(args, factory)
-        _warmup_asr(asr, load_audio_chunk(audio_path, 0, 1), chunk_size_sec=args.chunk_size)
+        asr.warmup(load_audio_chunk(audio_path, 0, 1))
         print("ASR warmup complete.\n")
 
         result = process_single_audio_file(audio_path, args, asr, online, args.chunk_size, factory)
